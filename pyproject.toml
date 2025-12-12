@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-apple"
+version = "0.1.0"
+description = "Apple GPU backend for vLLM using Metal"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "vLLM Apple Contributors"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "vllm>=0.7.0",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+metal = [
+    "pyobjc-framework-Metal",
+    "pyobjc-framework-MetalPerformanceShaders",
+]
+dev = [
+    "pytest",
+    "black",
+    "isort",
+    "mypy",
+]
+
+[project.entry-points."vllm.platform_plugins"]
+apple = "vllm_apple:register"
+
+[project.entry-points."vllm.general_plugins"]
+apple_ops = "vllm_apple:register_ops"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_apple*"]
+
+[tool.setuptools.package-data]
+vllm_apple = ["extension/kernels/*.metal", "extension/compiled/*.metallib"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
