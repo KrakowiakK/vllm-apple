@@ -1080,7 +1080,7 @@ class AppleModelRunner:
 
         Args:
             model_input: Prepared model input
-            scheduler_output: Scheduler output (needed for engine mode step_kind)
+            scheduler_output: Scheduler output (used by execute_model)
 
         Returns:
             Tuple of (output_tensor, is_logits):
@@ -1090,7 +1090,7 @@ class AppleModelRunner:
         # Engine mode path (v2.0 Metal engine)
         if self._use_engine_mode:
             if self._engine_runner is not None:
-                return self._execute_forward_engine(model_input, scheduler_output), True
+                return self._execute_forward_engine(model_input), True
             else:
                 # Engine mode enabled but runner not initialized
                 if is_strict_mode():
@@ -1123,7 +1123,6 @@ class AppleModelRunner:
     def _execute_forward_engine(
         self,
         model_input: AppleModelInput,
-        scheduler_output: "SchedulerOutput" = None,
     ) -> torch.Tensor:
         """Execute forward pass using v2.0 Metal engine.
 
@@ -1132,10 +1131,9 @@ class AppleModelRunner:
 
         Args:
             model_input: Prepared model input
-            scheduler_output: Scheduler output for step_kind derivation
 
         Returns:
-            Logits from the model [num_reqs, vocab_size]
+            Logits from the model [num_tokens, vocab_size]
             (Engine computes LM head internally)
         """
         from vllm_apple.engine import StepDescriptor, EngineInputs
@@ -1143,21 +1141,10 @@ class AppleModelRunner:
         # Convert AppleModelInput to EngineInputs
         attn_metadata = model_input.attn_metadata
 
-        # Derive step_kind from scheduler output for correctness in mixed batches
-        # Pure prefill: all requests have num_computed_tokens == 0
-        # Pure decode: all requests have num_computed_tokens > 0
-        # Mixed: some prefill, some decode - treat as prefill (more conservative)
-        if scheduler_output is not None:
-            num_prefill_reqs = sum(
-                1 for req in scheduler_output.scheduled_new_reqs
-            ) + sum(
-                1 for req in scheduler_output.scheduled_cached_reqs
-                if req.num_computed_tokens == 0
-            )
-            step_kind = "prefill" if num_prefill_reqs > 0 else "decode"
-        else:
-            # Fallback: use attn_metadata heuristic
-            step_kind = "prefill" if attn_metadata.num_prefills > 0 else "decode"
+        # Derive step_kind from attn_metadata
+        # num_prefills > 0 indicates prefill requests in the batch
+        # This is set by the attention backend during input preparation
+        step_kind = "prefill" if attn_metadata.num_prefills > 0 else "decode"
 
         step_desc = StepDescriptor(
             step_id=0,  # Will be tracked by runner
@@ -1217,10 +1204,22 @@ class AppleModelRunner:
                 pooler_output=[],
             )
 
-        # If is_logits=True, hidden_states are already logits [num_reqs, vocab_size]
-        # from engine mode - skip extraction and LM head
+        # If is_logits=True, hidden_states are already logits from engine mode
+        # Engine returns [num_tokens, vocab_size], need to extract last token per seq for prefill
         if is_logits:
-            logits = hidden_states
+            # Check if we need to extract last token positions (prefill case)
+            num_reqs = model_input.num_reqs
+            if hidden_states.shape[0] != num_reqs:
+                # Prefill: engine returns [num_tokens, vocab_size], extract last token per seq
+                last_token_positions = []
+                current_pos = 0
+                for seq_len in model_input.seq_lens:
+                    last_token_positions.append(current_pos + seq_len - 1)
+                    current_pos += seq_len
+                logits = hidden_states[last_token_positions]
+            else:
+                # Decode: engine returns [num_reqs, vocab_size], use directly
+                logits = hidden_states
         else:
             # Calculate positions of last tokens
             last_token_positions = []
