@@ -16,8 +16,8 @@ Available Operations:
     rmsnorm.py      - RMSNorm kernel
     mlp.py          - MLP/FFN encoding
     elementwise.py  - Residual, activation, RoPE
-    embedding.py    - Token embedding
-    lm_head.py      - LM head projection
+    embedding.py    - Token embedding (TODO)
+    lm_head.py      - LM head projection (TODO)
 
 Usage:
     from vllm_apple.engine.ops import PagedAttentionOp, KVWriteOp
@@ -31,11 +31,20 @@ Usage:
 
 # Lazy imports to avoid loading all ops when only some are needed
 __all__ = [
+    # Attention ops
     "PagedAttentionOp",
     "KVWriteOp",
+    # GEMM and projections
     "EngineGEMM",
     "EngineQKVProjection",
     "EngineOProjection",
+    # Normalization
+    "EngineRMSNorm",
+    # Elementwise ops
+    "EngineElementwiseOps",
+    "EngineRoPE",
+    # MLP
+    "EngineMLP",
 ]
 
 
@@ -56,4 +65,16 @@ def __getattr__(name):
     elif name == "EngineOProjection":
         from .qkv import EngineOProjection
         return EngineOProjection
+    elif name == "EngineRMSNorm":
+        from .rmsnorm import EngineRMSNorm
+        return EngineRMSNorm
+    elif name == "EngineElementwiseOps":
+        from .elementwise import EngineElementwiseOps
+        return EngineElementwiseOps
+    elif name == "EngineRoPE":
+        from .elementwise import EngineRoPE
+        return EngineRoPE
+    elif name == "EngineMLP":
+        from .mlp import EngineMLP
+        return EngineMLP
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
