@@ -236,7 +236,8 @@ class EngineMLP:
         I = self.config.intermediate_size
 
         # Step 1: gate_proj(x) -> gate_intermediate
-        # [num_tokens, H] @ [H, I] -> [num_tokens, I]
+        # [num_tokens, H] @ [I, H]^T -> [num_tokens, I]
+        # PyTorch weight is [out, in] = [I, H], need transpose
         self._gemm.encode(
             step_ctx=step_ctx,
             A=hidden_states,
@@ -245,10 +246,11 @@ class EngineMLP:
             M=num_tokens,
             K=H,
             N=I,
+            transpose_B=True,  # PyTorch weight is [I, H]
         )
 
         # Step 2: up_proj(x) -> up_intermediate
-        # [num_tokens, H] @ [H, I] -> [num_tokens, I]
+        # [num_tokens, H] @ [I, H]^T -> [num_tokens, I]
         self._gemm.encode(
             step_ctx=step_ctx,
             A=hidden_states,
@@ -257,6 +259,7 @@ class EngineMLP:
             M=num_tokens,
             K=H,
             N=I,
+            transpose_B=True,  # PyTorch weight is [I, H]
         )
 
         # Memory barrier after GEMMs
@@ -276,7 +279,8 @@ class EngineMLP:
         step_ctx.memory_barrier()
 
         # Step 4: down_proj(fused_intermediate) -> output
-        # [num_tokens, I] @ [I, H] -> [num_tokens, H]
+        # [num_tokens, I] @ [H, I]^T -> [num_tokens, H]
+        # PyTorch weight is [out, in] = [H, I], need transpose
         self._gemm.encode(
             step_ctx=step_ctx,
             A=fused_intermediate,
@@ -285,6 +289,7 @@ class EngineMLP:
             M=num_tokens,
             K=I,
             N=H,
+            transpose_B=True,  # PyTorch weight is [H, I]
         )
 
     def _encode_standard_mlp(
@@ -303,6 +308,7 @@ class EngineMLP:
         I = self.config.intermediate_size
 
         # Step 1: up_proj(x) -> intermediate
+        # [num_tokens, H] @ [I, H]^T -> [num_tokens, I]
         self._gemm.encode(
             step_ctx=step_ctx,
             A=hidden_states,
@@ -311,6 +317,7 @@ class EngineMLP:
             M=num_tokens,
             K=H,
             N=I,
+            transpose_B=True,  # PyTorch weight is [I, H]
         )
 
         # Memory barrier
@@ -341,6 +348,7 @@ class EngineMLP:
         step_ctx.memory_barrier()
 
         # Step 3: down_proj(intermediate) -> output
+        # [num_tokens, I] @ [H, I]^T -> [num_tokens, H]
         self._gemm.encode(
             step_ctx=step_ctx,
             A=intermediate,
@@ -349,6 +357,7 @@ class EngineMLP:
             M=num_tokens,
             K=I,
             N=H,
+            transpose_B=True,  # PyTorch weight is [H, I]
         )
 
     def get_intermediate_size(self, num_tokens: int) -> int:

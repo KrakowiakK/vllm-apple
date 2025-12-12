@@ -55,6 +55,105 @@ except ImportError:
     MTLSize = None
 
 
+# Inline kernel source for KV write operations
+KV_WRITE_KERNEL_SOURCE = """
+#include <metal_stdlib>
+using namespace metal;
+
+// KV write for decode step (single token per sequence)
+// Each threadgroup handles one (seq, kv_head) pair
+// Threads cooperate to copy head_size elements
+kernel void kv_write_decode(
+    device half* key_cache [[buffer(0)]],
+    device half* value_cache [[buffer(1)]],
+    device const int* block_table [[buffer(2)]],
+    device const int* seq_lens [[buffer(3)]],
+    constant uint& num_seqs [[buffer(4)]],
+    constant uint& head_size [[buffer(5)]],
+    constant uint& block_size [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& max_blocks_per_seq [[buffer(8)]],
+    device const half* new_keys [[buffer(9)]],
+    device const half* new_values [[buffer(10)]],
+    uint2 gid [[threadgroup_position_in_grid]],  // (seq_idx, head_idx)
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    uint seq_idx = gid.x;
+    uint head_idx = gid.y;
+
+    if (seq_idx >= num_seqs || head_idx >= num_kv_heads) return;
+
+    // Get sequence length (current position is seq_len - 1 for decode)
+    int seq_len = seq_lens[seq_idx];
+    if (seq_len <= 0) return;
+
+    int token_pos = seq_len - 1;  // Position of new token
+    int block_idx = token_pos / int(block_size);
+    int token_in_block = token_pos % int(block_size);
+
+    // Get physical block from block table
+    int physical_block = block_table[seq_idx * max_blocks_per_seq + block_idx];
+    if (physical_block < 0) return;  // Invalid block
+
+    // Cache layout: [num_blocks, num_kv_heads, block_size, head_size]
+    uint cache_offset = physical_block * num_kv_heads * block_size * head_size
+                      + head_idx * block_size * head_size
+                      + token_in_block * head_size;
+
+    // New K/V layout: [num_seqs, num_kv_heads, head_size]
+    uint new_offset = seq_idx * num_kv_heads * head_size + head_idx * head_size;
+
+    // Copy elements (threads cooperate)
+    for (uint i = tid; i < head_size; i += 32) {
+        key_cache[cache_offset + i] = new_keys[new_offset + i];
+        value_cache[cache_offset + i] = new_values[new_offset + i];
+    }
+}
+
+// KV write for prefill step (multiple tokens via slot_mapping)
+// Each threadgroup handles one (token, kv_head) pair
+kernel void kv_write_prefill(
+    device half* key_cache [[buffer(0)]],
+    device half* value_cache [[buffer(1)]],
+    device const int* slot_mapping [[buffer(2)]],
+    constant uint& num_tokens [[buffer(3)]],
+    constant uint& head_size [[buffer(4)]],
+    constant uint& block_size [[buffer(5)]],
+    constant uint& num_kv_heads [[buffer(6)]],
+    device const half* new_keys [[buffer(7)]],
+    device const half* new_values [[buffer(8)]],
+    uint2 gid [[threadgroup_position_in_grid]],  // (token_idx, head_idx)
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    uint token_idx = gid.x;
+    uint head_idx = gid.y;
+
+    if (token_idx >= num_tokens || head_idx >= num_kv_heads) return;
+
+    // Get slot (absolute position in cache)
+    int slot = slot_mapping[token_idx];
+    if (slot < 0) return;  // Invalid slot
+
+    int block_idx = slot / int(block_size);
+    int token_in_block = slot % int(block_size);
+
+    // Cache layout: [num_blocks, num_kv_heads, block_size, head_size]
+    uint cache_offset = block_idx * num_kv_heads * block_size * head_size
+                      + head_idx * block_size * head_size
+                      + token_in_block * head_size;
+
+    // New K/V layout: [num_tokens, num_kv_heads, head_size]
+    uint new_offset = token_idx * num_kv_heads * head_size + head_idx * head_size;
+
+    // Copy elements
+    for (uint i = tid; i < head_size; i += 32) {
+        key_cache[cache_offset + i] = new_keys[new_offset + i];
+        value_cache[cache_offset + i] = new_values[new_offset + i];
+    }
+}
+"""
+
+
 @dataclass
 class KVWriteParams:
     """Parameters for KV write kernel."""
@@ -142,29 +241,19 @@ class KVWriteOp:
         )
 
     def _compile_kernel(self) -> None:
-        """Compile KV write kernel."""
-        # Find and compile shader
-        shader_path = Path(__file__).parent.parent.parent / "metal" / "kernels" / "paged_attention_fused.metal"
+        """Compile KV write kernels from inline source."""
+        # Use inline kernel source
+        self._context.compile_library("kv_write_inline", source_code=KV_WRITE_KERNEL_SOURCE)
 
-        if not shader_path.exists():
-            shader_path = Path(__file__).parent.parent / "kernels" / "kv_write.metal"
-
-        if shader_path.exists():
-            self._context.compile_library("kv_write", source_path=str(shader_path))
-        else:
-            logger.warning(f"KV write shader not found, using placeholder. Path: {shader_path}")
-            self._pipeline = None
-            self._kernel_name = None
-            return
-
-        # Get pipeline
+        # Get pipelines
         try:
-            self._pipeline = self._context.get_pipeline("kv_write", "kv_write_decode")
-            self._kernel_name = "kv_write_decode"
-        except RuntimeError:
-            logger.warning("KV write kernel not available")
-            self._pipeline = None
-            self._kernel_name = None
+            self._decode_pipeline = self._context.get_pipeline("kv_write_inline", "kv_write_decode")
+            self._prefill_pipeline = self._context.get_pipeline("kv_write_inline", "kv_write_prefill")
+            logger.debug("KV write kernels compiled successfully")
+        except RuntimeError as e:
+            logger.warning(f"KV write kernel compilation failed: {e}")
+            self._decode_pipeline = None
+            self._prefill_pipeline = None
 
     def encode_decode(
         self,
@@ -176,6 +265,9 @@ class KVWriteOp:
         block_table_buffer: Any,  # MTLBuffer [num_seqs, max_blocks]
         seq_lens_buffer: Any,  # MTLBuffer [num_seqs]
         num_seqs: int,
+        new_keys_offset: int = 0,  # Byte offset into new_keys_buffer
+        new_values_offset: int = 0,  # Byte offset into new_values_buffer
+        max_blocks_per_seq: int = 128,  # Max blocks per sequence in block_table
     ) -> None:
         """Encode KV write for decode step (single token per sequence).
 
@@ -191,55 +283,47 @@ class KVWriteOp:
             block_table_buffer: Block table MTLBuffer
             seq_lens_buffer: Sequence lengths MTLBuffer
             num_seqs: Number of sequences
+            new_keys_offset: Byte offset into new_keys_buffer (for views into QKV buffer)
+            new_values_offset: Byte offset into new_values_buffer (for views into QKV buffer)
+            max_blocks_per_seq: Maximum blocks per sequence (block_table second dim)
         """
-        if self._pipeline is None:
-            raise RuntimeError("KV write kernel not compiled")
+        if self._decode_pipeline is None:
+            raise RuntimeError("KV write decode kernel not compiled")
 
         if not step_ctx.is_encoding:
             raise RuntimeError("encode_decode() called outside ENCODE phase")
 
-        # Create params
-        params = KVWriteParams(
-            num_seqs=num_seqs,
-            head_size=self.head_size,
-            block_size=self.block_size,
-            num_kv_heads=self.num_kv_heads,
-            k_stride_block=self.kv_stride_block,
-            k_stride_head=self.kv_stride_head,
-            k_stride_token=self.kv_stride_token,
-            new_kv_stride_token=self.new_kv_stride_token,
-            new_kv_stride_head=self.new_kv_stride_head,
-        )
-
-        # Create params buffer
-        params_buffer = self._context.create_buffer_from_bytes(params.to_bytes())
-
         # Get encoder from step context
-        encoder = step_ctx.encoder
+        encoder = step_ctx.get_compute_encoder()
 
         # Set pipeline
-        encoder.setComputePipelineState_(self._pipeline)
+        encoder.setComputePipelineState_(self._decode_pipeline)
 
-        # Set buffers
-        # Kernel buffer layout:
-        # buffer(0): key_cache (writable)
-        # buffer(1): value_cache (writable)
+        # Set buffers matching new kernel signature:
+        # buffer(0): key_cache
+        # buffer(1): value_cache
         # buffer(2): block_table
         # buffer(3): seq_lens
-        # buffer(4): params
-        # buffer(5): new_keys
-        # buffer(6): new_values
+        # buffer(4-8): constants (num_seqs, head_size, block_size, num_kv_heads, max_blocks_per_seq)
+        # buffer(9): new_keys
+        # buffer(10): new_values
         encoder.setBuffer_offset_atIndex_(key_buffer, 0, 0)
         encoder.setBuffer_offset_atIndex_(value_buffer, 0, 1)
         encoder.setBuffer_offset_atIndex_(block_table_buffer, 0, 2)
         encoder.setBuffer_offset_atIndex_(seq_lens_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(params_buffer, 0, 4)
-        encoder.setBuffer_offset_atIndex_(new_keys_buffer, 0, 5)
-        encoder.setBuffer_offset_atIndex_(new_values_buffer, 0, 6)
 
-        # Dispatch
-        # Each threadgroup handles one (seq, kv_head) pair
-        threads_per_threadgroup = MTLSize(32, 1, 1)  # One SIMD group
+        # Set constants
+        encoder.setBytes_length_atIndex_(struct.pack("I", num_seqs), 4, 4)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.head_size), 4, 5)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.block_size), 4, 6)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.num_kv_heads), 4, 7)
+        encoder.setBytes_length_atIndex_(struct.pack("I", max_blocks_per_seq), 4, 8)
+
+        encoder.setBuffer_offset_atIndex_(new_keys_buffer, new_keys_offset, 9)
+        encoder.setBuffer_offset_atIndex_(new_values_buffer, new_values_offset, 10)
+
+        # Dispatch: one threadgroup per (seq, head) pair, 32 threads per group
+        threads_per_threadgroup = MTLSize(32, 1, 1)
         threadgroups = MTLSize(num_seqs, self.num_kv_heads, 1)
 
         encoder.dispatchThreadgroups_threadsPerThreadgroup_(
@@ -255,6 +339,8 @@ class KVWriteOp:
         value_buffer: Any,  # MTLBuffer (KV cache)
         slot_mapping_buffer: Any,  # MTLBuffer [num_tokens]
         num_tokens: int,
+        new_keys_offset: int = 0,  # Byte offset into new_keys_buffer
+        new_values_offset: int = 0,  # Byte offset into new_values_buffer
     ) -> None:
         """Encode KV write for prefill step (multiple tokens).
 
@@ -267,23 +353,50 @@ class KVWriteOp:
             new_values_buffer: New V values [num_tokens, num_kv_heads, head_size]
             key_buffer: Key cache MTLBuffer
             value_buffer: Value cache MTLBuffer
-            slot_mapping_buffer: Slot indices [num_tokens]
+            slot_mapping_buffer: Slot indices [num_tokens] (int32)
             num_tokens: Total number of tokens
+            new_keys_offset: Byte offset into new_keys_buffer
+            new_values_offset: Byte offset into new_values_buffer
         """
-        # Prefill KV write uses a different kernel that takes slot_mapping
-        # For now, we use a simple implementation that could be optimized
-
-        if self._pipeline is None:
-            raise RuntimeError("KV write kernel not compiled")
+        if self._prefill_pipeline is None:
+            raise RuntimeError("KV write prefill kernel not compiled")
 
         if not step_ctx.is_encoding:
             raise RuntimeError("encode_prefill() called outside ENCODE phase")
 
-        # For prefill, we need a kernel that handles slot_mapping
-        # This is a placeholder - the actual implementation would use
-        # a dedicated prefill KV write kernel
+        # Get encoder from step context
+        encoder = step_ctx.get_compute_encoder()
 
-        logger.warning("Prefill KV write not yet implemented - skipping encode")
+        # Set pipeline
+        encoder.setComputePipelineState_(self._prefill_pipeline)
+
+        # Set buffers matching kernel signature:
+        # buffer(0): key_cache
+        # buffer(1): value_cache
+        # buffer(2): slot_mapping
+        # buffer(3-6): constants (num_tokens, head_size, block_size, num_kv_heads)
+        # buffer(7): new_keys
+        # buffer(8): new_values
+        encoder.setBuffer_offset_atIndex_(key_buffer, 0, 0)
+        encoder.setBuffer_offset_atIndex_(value_buffer, 0, 1)
+        encoder.setBuffer_offset_atIndex_(slot_mapping_buffer, 0, 2)
+
+        # Set constants
+        encoder.setBytes_length_atIndex_(struct.pack("I", num_tokens), 4, 3)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.head_size), 4, 4)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.block_size), 4, 5)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.num_kv_heads), 4, 6)
+
+        encoder.setBuffer_offset_atIndex_(new_keys_buffer, new_keys_offset, 7)
+        encoder.setBuffer_offset_atIndex_(new_values_buffer, new_values_offset, 8)
+
+        # Dispatch: one threadgroup per (token, head) pair, 32 threads per group
+        threads_per_threadgroup = MTLSize(32, 1, 1)
+        threadgroups = MTLSize(num_tokens, self.num_kv_heads, 1)
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+            threadgroups, threads_per_threadgroup
+        )
 
     def get_params_dict(self) -> Dict[str, Any]:
         """Get operation parameters as dict."""

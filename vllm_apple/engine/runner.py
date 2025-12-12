@@ -316,7 +316,9 @@ class EngineRunner:
 
         # Copy inputs to GPU buffers
         # Ensure proper dtypes: positions, slot_mapping, seq_lens must be int32 for Metal kernels
-        token_ids_buffer = self._copy_to_buffer(inputs.token_ids, "token_ids")
+        # token_ids must be int32 for embedding kernel (device const int*)
+        token_ids_int32 = inputs.token_ids.to(torch.int32) if inputs.token_ids.dtype != torch.int32 else inputs.token_ids
+        token_ids_buffer = self._copy_to_buffer(token_ids_int32, "token_ids")
         positions_int32 = inputs.positions.to(torch.int32) if inputs.positions.dtype != torch.int32 else inputs.positions
         positions_buffer = self._copy_to_buffer(positions_int32, "positions")
         block_table_int32 = inputs.block_table.to(torch.int32) if inputs.block_table.dtype != torch.int32 else inputs.block_table
@@ -328,6 +330,10 @@ class EngineRunner:
 
         # Compute max position for RoPE bounds checking
         max_position_in_batch = int(inputs.positions.max().item()) if num_tokens > 0 else 0
+
+        # Compute max_seq_len for attention (on CPU before entering encode phase)
+        # This is more reliable than step_desc.max_num_blocks_per_seq which may be 0
+        max_seq_len = int(inputs.seq_lens.max().item()) if inputs.seq_lens.numel() > 0 else 0
 
         # Create step context
         with EngineStepContext(
@@ -371,6 +377,7 @@ class EngineRunner:
                     num_seqs=step_desc.num_seqs_active,
                     step_desc=step_desc,
                     max_position_in_batch=max_position_in_batch,
+                    max_seq_len=max_seq_len,
                 )
 
             # Final norm
@@ -418,6 +425,7 @@ class EngineRunner:
         num_seqs: int,
         step_desc: StepDescriptor,
         max_position_in_batch: int,
+        max_seq_len: int,
     ) -> Tuple[Any, Any]:
         """Encode a single transformer layer.
 
@@ -435,6 +443,7 @@ class EngineRunner:
             num_seqs: Number of sequences
             step_desc: Step descriptor
             max_position_in_batch: Maximum position ID for RoPE bounds check
+            max_seq_len: Maximum sequence length for attention
 
         Returns:
             Tuple of (new_hidden_states, new_residual_buffer)
@@ -505,7 +514,7 @@ class EngineRunner:
 
         # 4. Write K, V to cache
         # Get KV cache buffers for this layer
-        k_cache, v_cache = self._kv_cache.get_layer_cache(layer_idx)
+        k_cache, v_cache = self._kv_cache.get_buffers(layer_idx)
 
         # Create EngineTensor views for new K and V
         new_k_tensor = EngineTensor(
@@ -523,6 +532,8 @@ class EngineRunner:
 
         if step_desc.is_decode:
             # Decode: single token per sequence
+            # max_blocks_per_seq is the second dim of block_table
+            max_blocks_per_seq = step_desc.max_num_blocks_per_seq if step_desc.max_num_blocks_per_seq > 0 else 128
             layer_ops.kv_write.encode_decode(
                 step_ctx=step_ctx,
                 new_keys_buffer=new_k_tensor.buffer,
@@ -532,6 +543,9 @@ class EngineRunner:
                 block_table_buffer=block_table_buffer,
                 seq_lens_buffer=seq_lens_buffer,
                 num_seqs=num_seqs,
+                new_keys_offset=new_k_tensor.offset,
+                new_values_offset=new_v_tensor.offset,
+                max_blocks_per_seq=max_blocks_per_seq,
             )
         else:
             # Prefill: multiple tokens
@@ -543,13 +557,14 @@ class EngineRunner:
                 value_buffer=v_cache,
                 slot_mapping_buffer=slot_mapping_buffer,
                 num_tokens=num_tokens,
+                new_keys_offset=new_k_tensor.offset,
+                new_values_offset=new_v_tensor.offset,
             )
 
         step_ctx.memory_barrier()
 
         # 5. Attention
-        # Compute max_seq_len from seq_lens (TODO: pass from step_desc)
-        max_seq_len = step_desc.max_num_blocks_per_seq * self._kv_cache.block_size
+        # max_seq_len is passed from execute_step (computed on CPU from seq_lens)
 
         layer_ops.attention.encode(
             step_ctx=step_ctx,

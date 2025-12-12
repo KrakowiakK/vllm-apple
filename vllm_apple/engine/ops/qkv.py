@@ -429,6 +429,8 @@ class EngineOProjection:
         if not step_ctx.is_encoding:
             raise RuntimeError("encode() called outside ENCODE phase")
 
+        # O projection: [num_tokens, input_size] @ [hidden_size, input_size]^T -> [num_tokens, hidden_size]
+        # PyTorch weight is [out, in] = [hidden_size, input_size], need transpose
         self._gemm.encode(
             step_ctx=step_ctx,
             A=attn_output,
@@ -437,6 +439,7 @@ class EngineOProjection:
             M=num_tokens,
             K=self.input_size,
             N=self.hidden_size,
+            transpose_B=True,  # PyTorch weight is [hidden_size, input_size]
         )
 
         if self._bias_buffer is not None:
