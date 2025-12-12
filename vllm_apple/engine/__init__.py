@@ -99,6 +99,16 @@ def create_step_context(*args, **kwargs):
     from .step import EngineStepContext
     return EngineStepContext(*args, **kwargs)
 
+def create_engine_runner(*args, **kwargs):
+    """Create an engine runner."""
+    from .runner import EngineRunner
+    return EngineRunner(*args, **kwargs)
+
+def create_weight_loader(*args, **kwargs):
+    """Create a weight loader."""
+    from .weight_loader import EngineWeightLoader
+    return EngineWeightLoader(*args, **kwargs)
+
 __all__ = [
     # Config
     "EngineConfig",
@@ -137,4 +147,7 @@ __all__ = [
     # Context helpers
     "get_engine_context",
     "create_step_context",
+    # Runner and weight loader
+    "create_engine_runner",
+    "create_weight_loader",
 ]

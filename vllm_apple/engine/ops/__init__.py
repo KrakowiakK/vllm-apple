@@ -16,8 +16,8 @@ Available Operations:
     rmsnorm.py      - RMSNorm kernel
     mlp.py          - MLP/FFN encoding
     elementwise.py  - Residual, activation, RoPE
-    embedding.py    - Token embedding (TODO)
-    lm_head.py      - LM head projection (TODO)
+    embedding.py    - Token embedding lookup
+    lm_head.py      - LM head projection
 
 Usage:
     from vllm_apple.engine.ops import PagedAttentionOp, KVWriteOp
@@ -45,6 +45,9 @@ __all__ = [
     "EngineRoPE",
     # MLP
     "EngineMLP",
+    # Embedding and LM head
+    "EngineEmbedding",
+    "EngineLMHead",
 ]
 
 
@@ -77,4 +80,10 @@ def __getattr__(name):
     elif name == "EngineMLP":
         from .mlp import EngineMLP
         return EngineMLP
+    elif name == "EngineEmbedding":
+        from .embedding import EngineEmbedding
+        return EngineEmbedding
+    elif name == "EngineLMHead":
+        from .lm_head import EngineLMHead
+        return EngineLMHead
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
