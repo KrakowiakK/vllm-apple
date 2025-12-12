@@ -1178,7 +1178,7 @@ class AppleModelRunner:
             positions=model_input.positions.cpu(),
             block_table=attn_metadata.block_table.cpu() if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
             slot_mapping=attn_metadata.slot_mapping.cpu() if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
-            seq_lens=attn_metadata.seq_lens.cpu().to(torch.int32),
+            seq_lens=attn_metadata.seq_lens.to(device="cpu", dtype=torch.int32),
         )
 
         # Execute via engine runner
@@ -1186,6 +1186,13 @@ class AppleModelRunner:
 
         # Return logits directly (engine already computed LM head)
         # The caller will skip LM head when is_logits=True
+        #
+        # NOTE: Transferring logits to self.device (MPS) is a temporary tradeoff.
+        # This reintroduces MPS into the post-engine path, which conflicts with
+        # "pure Metal end-to-end" goal. Future options:
+        # - Keep logits on CPU and do CPU-based sampling
+        # - Have engine return top-k candidates directly (GPU selection kernel)
+        # For now, sampling uses PyTorch ops that expect device tensors.
         return outputs.logits.to(self.device)
 
     def _sample_tokens(

@@ -434,6 +434,68 @@ class TestEngineRunnerAPI:
         assert "max_blocks_per_seq" in sig.parameters
 
 
+class TestSeqLensSemantics:
+    """Test seq_lens semantic correctness for engine path.
+
+    CRITICAL: Engine expects FULL context lengths (computed + new tokens),
+    NOT query lengths (new tokens per step).
+    """
+
+    def test_seq_lens_source_in_engine_inputs(self):
+        """Verify _execute_forward_engine uses attn_metadata.seq_lens, not model_input.seq_lens.
+
+        This is a regression test for the critical bug where query lengths were
+        passed instead of full context lengths, causing:
+        - Wrong max_seq_len for attention
+        - Wrong KV-write positions (seq_len - 1)
+        - Wrong context lengths in paged attention
+        """
+        import inspect
+        import ast
+
+        # Read the source of _execute_forward_engine
+        from vllm_apple.v1.worker.apple_model_runner import AppleModelRunner
+
+        source = inspect.getsource(AppleModelRunner._execute_forward_engine)
+
+        # Parse the source to find EngineInputs construction
+        # The seq_lens= argument should reference attn_metadata.seq_lens, NOT model_input.seq_lens
+        assert "attn_metadata.seq_lens" in source, \
+            "EngineInputs.seq_lens should use attn_metadata.seq_lens (full context lengths)"
+
+        # Verify model_input.seq_lens is NOT used for EngineInputs.seq_lens
+        # (it may appear elsewhere for other purposes like logits extraction)
+        lines = source.split('\n')
+        for line in lines:
+            if 'seq_lens=' in line and 'EngineInputs' in source[:source.find(line)]:
+                assert 'model_input.seq_lens' not in line, \
+                    f"EngineInputs.seq_lens must NOT use model_input.seq_lens (query lengths): {line}"
+
+    def test_full_vs_query_seq_lens_semantics(self):
+        """Document the semantic difference between full and query seq_lens."""
+        # Scenario: decode step with 4 sequences, each generating 1 new token
+        # Query lengths (model_input.seq_lens): [1, 1, 1, 1] - new tokens per step
+        query_seq_lens = [1, 1, 1, 1]
+
+        # Full context lengths (attn_metadata.seq_lens): actual context sizes
+        # e.g., sequences with 512, 256, 128, 64 computed tokens + 1 new each
+        full_seq_lens = [513, 257, 129, 65]
+
+        # Engine MUST use full_seq_lens for:
+        # 1. max_seq_len for attention (determines KV range to attend to)
+        max_seq_len = max(full_seq_lens)
+        assert max_seq_len == 513, "max_seq_len should be 513 (largest context)"
+        assert max(query_seq_lens) == 1, "query max is only 1 (wrong for attention)"
+
+        # 2. KV-write position (seq_len - 1 gives slot for new token)
+        # For sequence 0: position should be 512 (0-indexed), not 0
+        kv_write_positions = [s - 1 for s in full_seq_lens]
+        assert kv_write_positions[0] == 512, "KV write position should be 512"
+
+        wrong_positions = [s - 1 for s in query_seq_lens]
+        assert wrong_positions[0] == 0, "Using query lens gives wrong position 0"
+
+
 class TestMaxSeqLenCalculation:
     """Test max_seq_len calculation from seq_lens."""
 
