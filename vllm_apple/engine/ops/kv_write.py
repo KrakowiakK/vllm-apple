@@ -91,6 +91,9 @@ kernel void kv_write_decode(
     int block_idx = token_pos / int(block_size);
     int token_in_block = token_pos % int(block_size);
 
+    // Guard against OOB read if seq_lens inconsistent with block_table
+    if (block_idx >= int(max_blocks_per_seq)) return;
+
     // Get physical block from block table
     int physical_block = block_table[seq_idx * max_blocks_per_seq + block_idx];
     if (physical_block < 0) return;  // Invalid block

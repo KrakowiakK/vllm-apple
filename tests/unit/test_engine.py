@@ -18,11 +18,9 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import torch
 
 
-# Skip all tests if Metal/MPS not available
-pytestmark = pytest.mark.skipif(
-    not torch.backends.mps.is_available(),
-    reason="MPS not available"
-)
+# Note: Most tests here don't require MPS - they test pure Python logic.
+# Only add @pytest.mark.skipif(not torch.backends.mps.is_available(), ...)
+# to individual tests that actually need Metal/MPS.
 
 
 class TestEngineImports:
@@ -343,51 +341,85 @@ class TestKVWriteParams:
 
 
 class TestSlotMappingValidation:
-    """Test slot_mapping validation for prefill KV write."""
+    """Test slot_mapping validation for prefill KV write.
+
+    These tests call the actual validate_slot_mapping() method using a mock
+    KV cache object. The validation is pure Python/numpy and doesn't require MPS.
+    """
+
+    def _create_mock_kv_cache(self, num_blocks: int, block_size: int):
+        """Create a mock object with minimal _desc for validation."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class MockDesc:
+            num_blocks: int
+            block_size: int
+
+        class MockKVCache:
+            def __init__(self, num_blocks, block_size):
+                self._desc = MockDesc(num_blocks=num_blocks, block_size=block_size)
+
+        # Import and bind the actual method
+        from vllm_apple.engine.kv_cache import EngineKVCache
+        mock = MockKVCache(num_blocks, block_size)
+        # Bind the actual validation method to our mock
+        mock.validate_slot_mapping = lambda slot_mapping, context="": \
+            EngineKVCache.validate_slot_mapping(mock, slot_mapping, context)
+        return mock
 
     def test_valid_slot_mapping(self):
         """Test valid slot_mapping passes validation."""
-        # Simulate validation logic
-        num_blocks = 100
-        block_size = 16
-        max_valid_slot = num_blocks * block_size - 1
+        mock_cache = self._create_mock_kv_cache(num_blocks=100, block_size=16)
+        max_valid_slot = 100 * 16 - 1  # 1599
 
-        # Valid slot_mapping
+        # Valid slot_mapping - should not raise
         slot_mapping = np.array([0, 1, 15, 100, max_valid_slot], dtype=np.int32)
-
-        # Check all are within range
-        valid_mask = slot_mapping >= 0
-        max_slot = slot_mapping[valid_mask].max()
-        assert max_slot <= max_valid_slot
+        mock_cache.validate_slot_mapping(slot_mapping)  # No exception
 
     def test_invalid_slot_oob(self):
-        """Test OOB slot_mapping detected."""
-        num_blocks = 100
-        block_size = 16
-        max_valid_slot = num_blocks * block_size - 1  # 1599
+        """Test OOB slot_mapping raises ValueError."""
+        mock_cache = self._create_mock_kv_cache(num_blocks=100, block_size=16)
 
-        # Invalid: slot 2000 is out of bounds
+        # Invalid: slot 2000 is out of bounds (max is 1599)
         slot_mapping = np.array([0, 1, 2000], dtype=np.int32)
 
-        valid_mask = slot_mapping >= 0
-        max_slot = slot_mapping[valid_mask].max()
-        assert max_slot > max_valid_slot  # Should be detected as OOB
+        with pytest.raises(ValueError, match="Slot mapping contains index 2000"):
+            mock_cache.validate_slot_mapping(slot_mapping)
 
     def test_negative_one_allowed(self):
         """Test -1 is allowed in slot_mapping (padding)."""
-        slot_mapping = np.array([0, -1, 10, -1, 20], dtype=np.int32)
+        mock_cache = self._create_mock_kv_cache(num_blocks=100, block_size=16)
 
-        # -1 should be allowed, other negatives not
-        invalid_mask = slot_mapping < -1
-        assert not invalid_mask.any()
+        # -1 should be allowed for padding
+        slot_mapping = np.array([0, -1, 10, -1, 20], dtype=np.int32)
+        mock_cache.validate_slot_mapping(slot_mapping)  # No exception
 
     def test_invalid_negative(self):
-        """Test invalid negative values detected."""
-        slot_mapping = np.array([0, -2, 10], dtype=np.int32)
+        """Test invalid negative values raise ValueError."""
+        mock_cache = self._create_mock_kv_cache(num_blocks=100, block_size=16)
 
         # -2 is invalid (only -1 allowed)
-        invalid_mask = slot_mapping < -1
-        assert invalid_mask.any()
+        slot_mapping = np.array([0, -2, 10], dtype=np.int32)
+
+        with pytest.raises(ValueError, match="invalid index -2"):
+            mock_cache.validate_slot_mapping(slot_mapping)
+
+    def test_torch_tensor_input(self):
+        """Test validation works with torch.Tensor on CPU."""
+        mock_cache = self._create_mock_kv_cache(num_blocks=100, block_size=16)
+
+        # Valid torch tensor
+        slot_mapping = torch.tensor([0, 10, 100], dtype=torch.int32)
+        mock_cache.validate_slot_mapping(slot_mapping)  # No exception
+
+    def test_empty_slot_mapping(self):
+        """Test empty slot_mapping passes validation."""
+        mock_cache = self._create_mock_kv_cache(num_blocks=100, block_size=16)
+
+        # Empty array should pass (no slots to validate)
+        slot_mapping = np.array([], dtype=np.int32)
+        mock_cache.validate_slot_mapping(slot_mapping)  # No exception
 
 
 class TestMaxSeqLenCalculation:
