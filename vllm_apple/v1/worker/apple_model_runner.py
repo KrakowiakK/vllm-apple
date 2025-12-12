@@ -52,6 +52,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.utils import bind_kv_cache
 
+# Engine mode imports (v2.0 Metal engine)
+from vllm_apple.engine import is_engine_mode_enabled
+
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
 
@@ -131,6 +134,12 @@ class AppleModelRunner:
 
         # Model will be loaded in load_model()
         self.model: Optional[nn.Module] = None
+
+        # Engine mode (v2.0 Metal engine)
+        self._use_engine_mode = is_engine_mode_enabled()
+        self._engine_runner = None  # Initialized in load_model if engine mode
+        if self._use_engine_mode:
+            logger.info("Engine mode enabled (VLLM_APPLE_USE_ENGINE=1)")
 
         # KV cache configuration
         self.kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -228,6 +237,59 @@ class AppleModelRunner:
             self.kv_cache_device = str(self.device)
 
         logger.info("Model loaded successfully on %s (KV cache on %s)", self.device, self.kv_cache_device)
+
+        # Initialize engine runner if engine mode is enabled
+        if self._use_engine_mode:
+            self._init_engine_runner()
+
+    def _init_engine_runner(self) -> None:
+        """Initialize the engine runner for v2.0 Metal engine mode.
+
+        This sets up:
+        1. MetalEngineContext with device and pipelines
+        2. EngineKVCache wrapping the allocated KV cache
+        3. EngineRunner with model weights
+
+        Must be called after load_model() and initialize_kv_cache().
+        """
+        from vllm_apple.engine import (
+            create_engine_runner,
+            MetalEngineContext,
+            EngineKVCache,
+            ModelDescriptor,
+            KVCacheDescriptor,
+        )
+
+        logger.info("Initializing engine runner...")
+
+        # Create engine context
+        context = MetalEngineContext()
+
+        # Create model descriptor from config
+        model_desc = ModelDescriptor(
+            hidden_size=self.model_config.get_hidden_size(),
+            num_attention_heads=self.model_config.get_num_attention_heads(),
+            num_kv_heads=self.model_config.get_num_kv_heads(),
+            num_layers=self.model_config.get_num_layers(),
+            head_size=self.model_config.get_head_size(),
+            intermediate_size=self.model_config.get_intermediate_size(),
+            vocab_size=self.vocab_size,
+            max_position=self.max_model_len,
+            rope_theta=getattr(self.model_config.hf_config, 'rope_theta', 10000.0),
+        )
+
+        # Engine KV cache will be initialized in initialize_kv_cache
+        # For now, just store the context and model_desc
+        self._engine_context = context
+        self._engine_model_desc = model_desc
+
+        logger.info(
+            "Engine runner initialized: %d layers, hidden=%d, heads=%d/%d",
+            model_desc.num_layers,
+            model_desc.hidden_size,
+            model_desc.num_attention_heads,
+            model_desc.num_kv_heads,
+        )
 
     def get_model(self) -> nn.Module:
         """Return the loaded model.
@@ -1018,6 +1080,11 @@ class AppleModelRunner:
         Returns:
             Hidden states from the model [num_tokens, hidden_size]
         """
+        # Engine mode path (v2.0 Metal engine)
+        if self._use_engine_mode and self._engine_runner is not None:
+            return self._execute_forward_engine(model_input)
+
+        # Standard PyTorch path
         # Set forward context - attention layers access KV caches through this
         with set_forward_context(
             model_input.attn_metadata,
@@ -1031,6 +1098,49 @@ class AppleModelRunner:
             )
 
         return hidden_states
+
+    def _execute_forward_engine(
+        self,
+        model_input: AppleModelInput,
+    ) -> torch.Tensor:
+        """Execute forward pass using v2.0 Metal engine.
+
+        This path uses the EngineRunner for pure Metal execution with
+        step-boundary-only synchronization.
+
+        Args:
+            model_input: Prepared model input
+
+        Returns:
+            Hidden states from the model [num_tokens, hidden_size]
+        """
+        from vllm_apple.engine import StepDescriptor, EngineInputs
+
+        # Convert AppleModelInput to EngineInputs
+        attn_metadata = model_input.attn_metadata
+
+        step_desc = StepDescriptor(
+            step_id=0,  # Will be tracked by runner
+            step_kind="prefill" if attn_metadata.num_prefills > 0 else "decode",
+            num_scheduled_tokens=model_input.num_scheduled_tokens,
+            num_seqs_active=attn_metadata.num_seqs,
+            max_num_blocks_per_seq=attn_metadata.max_num_blocks_per_seq if hasattr(attn_metadata, 'max_num_blocks_per_seq') else 0,
+        )
+
+        engine_inputs = EngineInputs(
+            token_ids=model_input.input_ids.cpu(),
+            positions=model_input.positions.cpu(),
+            block_table=attn_metadata.block_table.cpu() if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
+            slot_mapping=attn_metadata.slot_mapping.cpu() if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
+            seq_lens=torch.tensor(model_input.seq_lens, dtype=torch.int32),
+        )
+
+        # Execute via engine runner
+        outputs = self._engine_runner.execute_step(step_desc, engine_inputs)
+
+        # Return logits as hidden states (engine already computed LM head)
+        # The caller (_sample_tokens) will handle sampling
+        return outputs.logits.to(self.device)
 
     def _sample_tokens(
         self,

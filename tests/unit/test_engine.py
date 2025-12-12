@@ -422,6 +422,18 @@ class TestSlotMappingValidation:
         mock_cache.validate_slot_mapping(slot_mapping)  # No exception
 
 
+class TestEngineRunnerAPI:
+    """Ensure runner API stays consistent for ops."""
+
+    def test_encode_transformer_layer_accepts_max_blocks_per_seq(self):
+        """Regression test: max_blocks_per_seq must be passed into layer encode."""
+        import inspect
+        from vllm_apple.engine.runner import EngineRunner
+
+        sig = inspect.signature(EngineRunner._encode_transformer_layer)
+        assert "max_blocks_per_seq" in sig.parameters
+
+
 class TestMaxSeqLenCalculation:
     """Test max_seq_len calculation from seq_lens."""
 

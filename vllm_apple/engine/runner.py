@@ -343,6 +343,18 @@ class EngineRunner:
             # Fallback: compute from max_seq_len and block_size
             max_blocks_per_seq = (max_seq_len + self._kv_cache.block_size - 1) // self._kv_cache.block_size if max_seq_len > 0 else 1
 
+        if (
+            inputs.block_table.ndim == 2
+            and inputs.block_table.shape[1] > 0
+            and max_seq_len > max_blocks_per_seq * self._kv_cache.block_size
+        ):
+            raise ValueError(
+                f"seq_lens max ({max_seq_len}) exceeds block_table capacity "
+                f"({max_blocks_per_seq * self._kv_cache.block_size}). "
+                f"max_blocks_per_seq={max_blocks_per_seq}, block_size={self._kv_cache.block_size} "
+                f"(step {self._step_counter})."
+            )
+
         # Validate inputs before encoding to prevent OOB writes
         # Always validate block_table to catch seq_lens/block_table inconsistencies
         if inputs.block_table.numel() > 0:
@@ -401,6 +413,7 @@ class EngineRunner:
                     step_desc=step_desc,
                     max_position_in_batch=max_position_in_batch,
                     max_seq_len=max_seq_len,
+                    max_blocks_per_seq=max_blocks_per_seq,
                 )
 
             # Final norm
@@ -449,6 +462,7 @@ class EngineRunner:
         step_desc: StepDescriptor,
         max_position_in_batch: int,
         max_seq_len: int,
+        max_blocks_per_seq: int,
     ) -> Tuple[Any, Any]:
         """Encode a single transformer layer.
 
@@ -467,6 +481,7 @@ class EngineRunner:
             step_desc: Step descriptor
             max_position_in_batch: Maximum position ID for RoPE bounds check
             max_seq_len: Maximum sequence length for attention
+            max_blocks_per_seq: Maximum blocks per sequence (block_table second dim)
 
         Returns:
             Tuple of (new_hidden_states, new_residual_buffer)
