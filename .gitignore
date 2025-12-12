@@ -198,3 +198,6 @@ cython_debug/
 # Metal specific - keep compiled dylib
 *.dylib
 !vllm_apple/metal/native/libkv_write.dylib
+
+# Profile/debug scripts
+profile/
