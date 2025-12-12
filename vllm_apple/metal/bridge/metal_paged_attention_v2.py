@@ -172,6 +172,7 @@ class MetalPagedAttentionV2:
         if required_size > self._current_kv_buf_size:
             # Grow by 50% more than needed to reduce future reallocations
             new_size = int(required_size * 1.5)
+            old_size = self._current_kv_buf_size
             self.key_buf = self.device.newBufferWithLength_options_(
                 new_size, MTLResourceStorageModeShared
             )
@@ -181,14 +182,74 @@ class MetalPagedAttentionV2:
             self._current_kv_buf_size = new_size
             self._kv_cache_set = False  # Need to re-copy cache
 
+            # Log reallocation for debugging
+            import os
+            if os.environ.get("METAL_PROFILE_DETAIL"):
+                print(f"[METAL REALLOC] KV buffers: {old_size} -> {new_size} bytes (required: {required_size})")
+
     def _ensure_block_table_buffer_size(self, required_size: int):
         """Ensure block table buffer is large enough."""
         if required_size > self._current_block_table_buf_size:
+            old_size = self._current_block_table_buf_size
             new_size = int(required_size * 1.5)
             self.block_table_buf = self.device.newBufferWithLength_options_(
                 new_size, MTLResourceStorageModeShared
             )
             self._current_block_table_buf_size = new_size
+
+            # Log reallocation for debugging
+            import os
+            if os.environ.get("METAL_PROFILE_DETAIL"):
+                print(f"[METAL REALLOC] Block table buffer: {old_size} -> {new_size} bytes (required: {required_size})")
+
+    def _ensure_batch_buffers(self, required_batch_size: int):
+        """Grow all batch-related buffers together if needed.
+
+        This method ensures query_buf, output_buf, seq_lens_buf, and block_table_buf
+        are all large enough for the required batch size. All buffers are resized
+        together to maintain consistency.
+
+        Args:
+            required_batch_size: Number of sequences in the batch
+        """
+        if required_batch_size <= self.max_batch_size:
+            return
+
+        # Grow by 50% more than needed to reduce future reallocations
+        new_size = int(required_batch_size * 1.5)
+        old_size = self.max_batch_size
+        self.max_batch_size = new_size
+
+        # Log reallocation for debugging
+        import os
+        if os.environ.get("METAL_PROFILE_DETAIL"):
+            print(f"[METAL REALLOC] Batch buffers: {old_size} -> {new_size} (required: {required_batch_size})")
+
+        # Resize query buffer: [max_batch, num_query_heads, head_size]
+        query_size = new_size * self.num_query_heads * self.head_size * 2  # float16
+        self.query_buf = self.device.newBufferWithLength_options_(
+            query_size, MTLResourceStorageModeShared
+        )
+
+        # Resize output buffer: [max_batch, num_query_heads, head_size]
+        output_size = new_size * self.num_query_heads * self.head_size * 2  # float16
+        self.output_buf = self.device.newBufferWithLength_options_(
+            output_size, MTLResourceStorageModeShared
+        )
+
+        # Resize seq_lens buffer: [max_batch]
+        self.seq_lens_buf = self.device.newBufferWithLength_options_(
+            new_size * 4, MTLResourceStorageModeShared  # int32
+        )
+
+        # Resize block_table buffer: [max_batch, max_blocks_per_seq]
+        block_table_size = new_size * self.max_blocks_per_seq * 4  # int32
+        self.block_table_buf = self.device.newBufferWithLength_options_(
+            block_table_size, MTLResourceStorageModeShared
+        )
+        self._current_block_table_buf_size = block_table_size
+
+        # Params buffer is fixed size (76 bytes), no need to resize
 
     def _update_buffer(self, buffer, data: bytes, offset: int = 0):
         """Update buffer contents efficiently."""
@@ -266,6 +327,9 @@ class MetalPagedAttentionV2:
         num_seqs = query.shape[0]
         original_device = query.device
         is_mps = query.device.type == "mps"
+
+        # Ensure batch buffers are large enough (auto-resize if needed)
+        self._ensure_batch_buffers(num_seqs)
 
         if output is None:
             output = torch.zeros_like(query)
@@ -406,6 +470,9 @@ class MetalPagedAttentionV2:
             Output tensor with attention results
         """
         num_seqs = query.shape[0]
+
+        # Ensure batch buffers are large enough (auto-resize if needed)
+        self._ensure_batch_buffers(num_seqs)
 
         # Update query buffer
         self._update_buffer(self.query_buf, query.numpy().tobytes())

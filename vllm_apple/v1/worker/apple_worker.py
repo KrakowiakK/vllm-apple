@@ -330,9 +330,15 @@ class AppleWorker(WorkerBase):
 
                 unique_experts = count_unique_experts(topk_ids)
 
+                # CRITICAL: Disable combined weight cache for large MoE models (>32 experts)
+                # The combined weight cache creates ~1.2GB per layer, causing ~58GB memory
+                # pressure for 128-expert models like Qwen3-30B-A3B
+                if num_experts > 32:
+                    use_combined = False
+                    combine_reason = f"large_moe_model(experts={num_experts}>32)"
                 # Adaptive thresholds based on batch size and expert diversity
                 # 1. Small batches → always combine (cheap, cache hit)
-                if total_expert_tokens <= 256:
+                elif total_expert_tokens <= 256:
                     use_combined = True
                     combine_reason = "small_batch"
                 # 2. Medium batches → combine if gating patterns are similar
@@ -381,18 +387,47 @@ class AppleWorker(WorkerBase):
                 # Chunk size tuned for Apple Silicon - 64 gives best perf/memory balance
                 CHUNK_SIZE = 64
 
+                # Detailed timing for batch 16+ debugging
+                _detail_timing = os.environ.get("MOE_DETAIL_TIMING") and num_tokens >= 16
+                if _detail_timing:
+                    _t_flatten = _time.perf_counter()
+
                 # Flatten inputs
                 flat_topk_ids = topk_ids.view(-1).long()
                 flat_topk_weights = topk_weights.view(-1).to(orig_dtype)
                 expanded_hidden = hidden_states.unsqueeze(1).expand(-1, topk, -1).reshape(-1, hidden_size)
 
-                # Output tensor
+                # OPTIMIZATION: Sort by expert ID to improve memory locality for index_select
+                # This groups consecutive accesses to the same expert, dramatically improving
+                # cache hit rate when gathering 9.4MB weights per expert from 128 experts (1.2GB total)
+                sorted_expert_indices = torch.argsort(flat_topk_ids)
+                flat_topk_ids = flat_topk_ids[sorted_expert_indices]
+                flat_topk_weights = flat_topk_weights[sorted_expert_indices]
+                expanded_hidden = expanded_hidden[sorted_expert_indices]
+                # Keep inverse permutation to restore original order later
+                inverse_indices = torch.argsort(sorted_expert_indices)
+
+                if _detail_timing:
+                    torch.mps.synchronize()
+                    _flatten_ms = (_time.perf_counter() - _t_flatten) * 1000
+                    _t_alloc = _time.perf_counter()
+
+                # Output tensor (in sorted order, will be reordered at the end)
                 weighted_output = torch.zeros(
                     total_expert_tokens,
                     hidden_size,
                     dtype=orig_dtype,
                     device=hidden_states.device
                 )
+
+                if _detail_timing:
+                    torch.mps.synchronize()
+                    _alloc_ms = (_time.perf_counter() - _t_alloc) * 1000
+                    _index_select_ms = 0.0
+                    _bmm1_ms = 0.0
+                    _act_ms = 0.0
+                    _bmm2_ms = 0.0
+                    _store_ms = 0.0
 
                 # Process in chunks for memory efficiency
                 for chunk_start in range(0, total_expert_tokens, CHUNK_SIZE):
@@ -402,6 +437,9 @@ class AppleWorker(WorkerBase):
                     chunk_ids = flat_topk_ids[chunk_start:chunk_end]
                     chunk_weights = flat_topk_weights[chunk_start:chunk_end]
                     chunk_hidden = expanded_hidden[chunk_start:chunk_end]
+
+                    if _detail_timing:
+                        _t_op = _time.perf_counter()
 
                     if use_combined:
                         # OPTIMIZATION: Single gather from pre-combined weights (19% faster)
@@ -417,11 +455,21 @@ class AppleWorker(WorkerBase):
                         w1_chunk = torch.index_select(w1, 0, chunk_ids)
                         w2_chunk = torch.index_select(w2, 0, chunk_ids)
 
+                    if _detail_timing:
+                        torch.mps.synchronize()
+                        _index_select_ms += (_time.perf_counter() - _t_op) * 1000
+                        _t_op = _time.perf_counter()
+
                     # Batched matmul: gate_up projection
                     gate_up = torch.bmm(
                         chunk_hidden.unsqueeze(1),
                         w1_chunk.transpose(1, 2)
                     ).squeeze(1)
+
+                    if _detail_timing:
+                        torch.mps.synchronize()
+                        _bmm1_ms += (_time.perf_counter() - _t_op) * 1000
+                        _t_op = _time.perf_counter()
 
                     # OPTIMIZATION: Fused gate/up activation (7% faster)
                     if activation == "silu":
@@ -431,18 +479,49 @@ class AppleWorker(WorkerBase):
                     else:
                         activated = gate_up[:, :intermediate_size] * gate_up[:, intermediate_size:]
 
+                    if _detail_timing:
+                        torch.mps.synchronize()
+                        _act_ms += (_time.perf_counter() - _t_op) * 1000
+                        _t_op = _time.perf_counter()
+
                     # Down projection
                     expert_out = torch.bmm(
                         activated.unsqueeze(1),
                         w2_chunk.transpose(1, 2)
                     ).squeeze(1)
 
+                    if _detail_timing:
+                        torch.mps.synchronize()
+                        _bmm2_ms += (_time.perf_counter() - _t_op) * 1000
+                        _t_op = _time.perf_counter()
+
                     # Apply weights and store
                     weighted_output[chunk_start:chunk_end] = expert_out * chunk_weights.unsqueeze(-1)
+
+                    if _detail_timing:
+                        torch.mps.synchronize()
+                        _store_ms += (_time.perf_counter() - _t_op) * 1000
+
+                if _detail_timing:
+                    _t_reduce = _time.perf_counter()
+
+                # Restore original token order before reshaping
+                weighted_output = weighted_output[inverse_indices]
 
                 # Reshape and sum across topk dimension
                 weighted_output = weighted_output.view(num_tokens, topk, hidden_size)
                 final_output = weighted_output.sum(dim=1)
+
+                if _detail_timing:
+                    torch.mps.synchronize()
+                    _reduce_ms = (_time.perf_counter() - _t_reduce) * 1000
+                    _total_detail = _flatten_ms + _alloc_ms + _index_select_ms + _bmm1_ms + _act_ms + _bmm2_ms + _store_ms + _reduce_ms
+                    if _moe_profile['call_count'] % 48 == 0:  # Once per forward pass
+                        print(f"[MoE Detail] tokens={num_tokens}, chunks={total_expert_tokens//CHUNK_SIZE + 1}, "
+                              f"flatten={_flatten_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
+                              f"index_select={_index_select_ms:.1f}ms, bmm1={_bmm1_ms:.1f}ms, "
+                              f"act={_act_ms:.1f}ms, bmm2={_bmm2_ms:.1f}ms, store={_store_ms:.1f}ms, "
+                              f"reduce={_reduce_ms:.1f}ms, total={_total_detail:.1f}ms")
 
                 # Profiling
                 _moe_profile['call_count'] += 1

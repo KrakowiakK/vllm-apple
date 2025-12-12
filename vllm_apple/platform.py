@@ -154,9 +154,12 @@ class ApplePlatform(Platform):
             )
             return "vllm_apple.v1.attention.backends.metal_attn.MetalAttentionBackend"
 
-        # Default: Metal attention backend (PyTorch SDPA fallback)
-        logger.info("Using Metal attention backend from vllm-apple plugin.")
-        return "vllm_apple.v1.attention.backends.metal_attn.MetalAttentionBackend"
+        # Fallback: MPS attention backend (pure PyTorch SDPA)
+        logger.info(
+            f"Using MPS attention backend (head_size={head_size}). "
+            "Set VLLM_METAL_ATTENTION=1 for optimized Metal kernel."
+        )
+        return "vllm_apple.v1.attention.backends.mps_attn.MPSAttentionBackend"
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:

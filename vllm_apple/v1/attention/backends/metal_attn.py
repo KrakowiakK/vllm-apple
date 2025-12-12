@@ -74,6 +74,18 @@ try:
 except ImportError as e:
     logger.warning(f"Fused kernel import failed: {e}")
 
+# Configuration for fused kernel batch threshold
+# The fused kernel (VLLM_METAL_FUSED_KV=1) writes K/V AND computes attention in one dispatch.
+# It's optimal for small batches but has performance regression at higher concurrency
+# due to torch.mps.synchronize() overhead growing with pending MPS operations.
+#
+# VLLM_METAL_FUSED_MAX_SEQS: Maximum decode sequences for fused kernel (default=4)
+# - Set this to match your max_num_seqs config for optimal performance
+# - Set to 0 to always use fused kernel (small batch workloads)
+# - For batch sizes > 4, the non-fused path is typically better
+_FUSED_BATCH_THRESHOLD = int(os.environ.get("VLLM_METAL_FUSED_MAX_SEQS", "4"))
+logger.info(f"Metal attention config: fused_batch_threshold={_FUSED_BATCH_THRESHOLD}")
+
 # Profiling counters for Metal attention
 import time
 _metal_profile_enabled = True
@@ -199,6 +211,10 @@ class MetalAttentionMetadata:
         scheduler_metadata: Optional scheduler metadata
         causal: Whether to use causal masking
         num_decode_tokens: Number of decode tokens (at front of batch)
+
+    Cached properties:
+        _query_start_loc_cpu: Cached CPU list of query_start_loc
+        _seq_lens_cpu: Cached CPU list of seq_lens
     """
 
     num_actual_tokens: int
@@ -211,6 +227,24 @@ class MetalAttentionMetadata:
     scheduler_metadata: Optional[torch.Tensor]
     causal: bool = True
     num_decode_tokens: int = 0
+
+    # Cached CPU versions to avoid repeated .tolist() calls (device sync)
+    _query_start_loc_cpu: Optional[list] = None
+    _seq_lens_cpu: Optional[list] = None
+
+    @property
+    def query_start_loc_cpu(self) -> list:
+        """Get query_start_loc as CPU list (cached to avoid device sync)."""
+        if self._query_start_loc_cpu is None:
+            self._query_start_loc_cpu = self.query_start_loc.tolist()
+        return self._query_start_loc_cpu
+
+    @property
+    def seq_lens_cpu(self) -> list:
+        """Get seq_lens as CPU list (cached to avoid device sync)."""
+        if self._seq_lens_cpu is None:
+            self._seq_lens_cpu = self.seq_lens.tolist()
+        return self._seq_lens_cpu
 
 
 class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetadata]):
@@ -317,6 +351,9 @@ class MetalAttentionImpl(AttentionImpl):
         sinks: torch.Tensor | None = None,
     ) -> None:
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        # Track if this layer shares KV cache with another layer
+        # When True, we skip MetalKVCache allocation to avoid double memory usage
+        self._is_kv_shared = kv_sharing_target_layer_name is not None
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -358,8 +395,10 @@ class MetalAttentionImpl(AttentionImpl):
         self._use_fused_decode: bool = _FUSED_KERNEL_AVAILABLE
 
         # MetalKVCache instance for this layer (zero-copy KV cache in MTLBuffer)
+        # NOTE: When _is_kv_shared=True, we DON'T allocate MetalKVCache
+        # because this layer shares KV with another layer (e.g., encoder-decoder)
         self._metal_kv_cache: Optional[MetalKVCache] = None
-        self._metal_kv_cache_initialized: bool = False
+        self._metal_kv_cache_initialized: bool = self._is_kv_shared  # Skip init if shared
 
         # CPU tensor cache for decode path (KROK 2: CPU optimization)
         # Avoids repeated allocation and MPS->CPU transfers
@@ -371,8 +410,15 @@ class MetalAttentionImpl(AttentionImpl):
         self._cached_seq_lens_cpu: Optional[torch.Tensor] = None
         self._cached_metadata_id: Optional[int] = None  # Track metadata changes
 
+    # Default initial batch size - auto-resize handles exceeding this
+    _DEFAULT_INITIAL_BATCH_SIZE: int = 64
+
     def _get_or_create_metal_kernel(self, block_size: int, max_num_blocks: int = 4096) -> MetalPagedAttention:
-        """Get or create Metal kernel for this configuration."""
+        """Get or create Metal kernel for this configuration.
+
+        The kernel uses an initial max_batch_size but will auto-resize
+        if batches exceed this value.
+        """
         key = (self.num_kv_heads, self.num_heads, self.head_size, block_size)
 
         if key not in MetalAttentionImpl._metal_kernels:
@@ -388,7 +434,7 @@ class MetalAttentionImpl(AttentionImpl):
                 block_size=block_size,
                 scale=self.scale,
                 max_num_blocks=max_num_blocks,
-                max_batch_size=256,
+                max_batch_size=self._DEFAULT_INITIAL_BATCH_SIZE,
             )
 
         return MetalAttentionImpl._metal_kernels[key]
@@ -411,7 +457,7 @@ class MetalAttentionImpl(AttentionImpl):
                     block_size=block_size,
                     scale=self.scale,
                     max_num_blocks=max_num_blocks,
-                    max_batch_size=256,
+                    max_batch_size=self._DEFAULT_INITIAL_BATCH_SIZE,
                 )
                 if self._fused_kernel.is_fused_available:
                     logger.info(
@@ -557,6 +603,16 @@ class MetalAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             return output
 
+        # KV SHARING SAFETY CHECKS
+        # When this layer shares KV cache with another layer, we:
+        # 1. Don't update KV cache (target layer handles it)
+        # 2. Don't use MetalKVCache (it's not allocated for shared layers)
+        # 3. Use PyTorch kv_cache tensor passed by vLLM for attention
+        if self._is_kv_shared:
+            # For shared layers, key/value should be None (no new K/V to write)
+            # However, vLLM may still pass them - just ignore and use kv_cache
+            pass  # Continue to handle via existing kv_sharing_target_layer_name checks
+
         # Profiling start
         global _metal_profile_data, _metal_profile_enabled
         _t_forward_start = time.perf_counter() if _metal_profile_enabled else 0
@@ -587,11 +643,19 @@ class MetalAttentionImpl(AttentionImpl):
 
         # ETAP 4: Check if we can use fused kernel for decode
         # Fused kernel writes K/V AND computes attention in one pass
+        # IMPORTANT: Fused kernel is disabled when VLLM_METAL_FUSED_MAX_SEQS is exceeded
+        # because torch.mps.synchronize() overhead grows with pending MPS operations.
+        # For high-concurrency workloads (max_num_seqs > 4), the non-fused path is better
+        # as it has separate smaller sync points.
         fused_kernel = None
         use_fused_for_decode = False
+
+        # Use fused kernel only if configured for small batches AND runtime batch is small
+        # _FUSED_BATCH_THRESHOLD should match user's max_num_seqs config
         if (
             self._use_fused_decode
             and num_decode_tokens > 0
+            and (_FUSED_BATCH_THRESHOLD == 0 or num_decode_tokens <= _FUSED_BATCH_THRESHOLD)
             and self.kv_sharing_target_layer_name is None
             and key is not None
             and value is not None
@@ -640,11 +704,12 @@ class MetalAttentionImpl(AttentionImpl):
             if _metal_profile_enabled:
                 _metal_profile_data['sdpa_compute_ms'] += (time.perf_counter() - _t_sdpa_start) * 1000
 
-        # Process decode tokens
+        # Process decode tokens using Metal kernel
         if num_decode_tokens > 0:
             _t_metal_start = time.perf_counter() if _metal_profile_enabled else 0
             if use_fused_for_decode:
                 # ETAP 4: Fused KV-write + attention in one kernel dispatch
+                # Best for small batches (max_num_seqs <= 4)
                 self._compute_attention_fused(
                     query[:num_decode_tokens],
                     key[:num_decode_tokens],
@@ -654,7 +719,8 @@ class MetalAttentionImpl(AttentionImpl):
                     fused_kernel,
                 )
             else:
-                # Fallback: separate KV update already done, just compute attention
+                # Non-fused Metal kernel: separate KV update already done
+                # Better for larger batches due to smaller per-operation sync overhead
                 self._compute_attention_with_metal_zero_copy(
                     query[:num_decode_tokens],
                     output[:num_decode_tokens],
@@ -881,6 +947,107 @@ class MetalAttentionImpl(AttentionImpl):
         key_cache_flat.scatter_(0, idx, key)
         value_cache_flat.scatter_(0, idx, value)
 
+    def _compute_decode_with_sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        output: torch.Tensor,
+        attn_metadata: MetalAttentionMetadata,
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute decode attention using pure SDPA (no MPS sync required).
+
+        This is a fallback for large batches where torch.mps.synchronize() in
+        the Metal kernel path causes severe performance degradation.
+
+        For each decode sequence:
+        1. Gather historical KV from kv_cache using block_table
+        2. Prepend current step's new K/V
+        3. Compute attention with SDPA
+
+        Args:
+            query: [num_decode_tokens, num_query_heads, head_size]
+            key: [num_decode_tokens, num_kv_heads, head_size] or None
+            value: [num_decode_tokens, num_kv_heads, head_size] or None
+            output: [num_decode_tokens, num_query_heads, head_size]
+            attn_metadata: Contains block_table and seq_lens
+            kv_cache: [2, num_blocks, block_size, num_kv_heads, head_size]
+        """
+        num_decode_seqs = query.shape[0]
+        block_table = attn_metadata.block_table  # [num_seqs, max_blocks_per_seq]
+        device = query.device  # MPS or CPU
+
+        # Get cache dimensions
+        # kv_cache shape: [2, num_blocks, block_size, num_kv_heads, head_size]
+        key_cache = kv_cache[0]  # [num_blocks, block_size, num_kv_heads, head_size]
+        value_cache = kv_cache[1]  # [num_blocks, block_size, num_kv_heads, head_size]
+        num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+
+        # Use cached CPU list to avoid device sync per layer
+        seq_lens_list = attn_metadata.seq_lens_cpu
+
+        for seq_idx in range(num_decode_seqs):
+            seq_len = seq_lens_list[seq_idx]  # Total tokens including current
+            if seq_len == 0:
+                continue
+
+            # Gather historical KV tokens from cache
+            # block_table[seq_idx] contains block indices for this sequence
+            num_blocks_needed = (seq_len + block_size - 1) // block_size
+            blocks = block_table[seq_idx, :num_blocks_needed]  # [num_blocks_needed]
+
+            # Gather all KV tokens for this sequence
+            # Result: [seq_len, num_kv_heads, head_size]
+            gathered_k_list = []
+            gathered_v_list = []
+            tokens_gathered = 0
+
+            for block_idx in range(num_blocks_needed):
+                block_id = blocks[block_idx].item()
+                tokens_in_block = min(block_size, seq_len - tokens_gathered)
+                gathered_k_list.append(key_cache[block_id, :tokens_in_block])
+                gathered_v_list.append(value_cache[block_id, :tokens_in_block])
+                tokens_gathered += tokens_in_block
+
+            k_seq = torch.cat(gathered_k_list, dim=0)  # [seq_len, num_kv_heads, head_size]
+            v_seq = torch.cat(gathered_v_list, dim=0)  # [seq_len, num_kv_heads, head_size]
+
+            # Move KV to same device as query (KV cache may be on CPU)
+            if k_seq.device != device:
+                k_seq = k_seq.to(device)
+                v_seq = v_seq.to(device)
+
+            # Query for this sequence: [1, num_query_heads, head_size]
+            q_seq = query[seq_idx:seq_idx+1]
+
+            # Transpose for SDPA: [num_heads, seq_len, head_size]
+            q = q_seq.transpose(0, 1)  # [num_query_heads, 1, head_size]
+            k = k_seq.transpose(0, 1)  # [num_kv_heads, seq_len, head_size]
+            v = v_seq.transpose(0, 1)  # [num_kv_heads, seq_len, head_size]
+
+            # Handle GQA: repeat KV heads if needed
+            if num_kv_heads != self.num_heads:
+                k = k.repeat_interleave(self.num_queries_per_kv, dim=0)
+                v = v.repeat_interleave(self.num_queries_per_kv, dim=0)
+
+            # Compute attention using SDPA
+            # Query attends to all historical tokens (causal not needed - query is single token)
+            attn_out = F.scaled_dot_product_attention(
+                q.unsqueeze(0),  # [1, num_query_heads, 1, head_size]
+                k.unsqueeze(0),  # [1, num_query_heads, seq_len, head_size]
+                v.unsqueeze(0),  # [1, num_query_heads, seq_len, head_size]
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,  # Decode: single query attends to all past
+                scale=self.scale,
+            )
+
+            # Store result: [num_query_heads, 1, head_size] -> [1, num_query_heads, head_size]
+            output[seq_idx] = attn_out.squeeze(0).transpose(0, 1).squeeze(0)
+
+        return output
+
     def _compute_attention_no_cache(
         self,
         query: torch.Tensor,
@@ -921,7 +1088,8 @@ class MetalAttentionImpl(AttentionImpl):
             return output
 
         # Multiple sequences: iterate
-        start_locs = query_start_loc.tolist()
+        # Use cached CPU list to avoid device sync per layer
+        start_locs = attn_metadata.query_start_loc_cpu
 
         for seq_idx in range(num_seqs):
             start = start_locs[seq_idx]
@@ -1062,6 +1230,11 @@ class MetalAttentionImpl(AttentionImpl):
             output: [num_decode_tokens, num_heads, head_size]
             attn_metadata: Contains block_table and seq_lens
         """
+        # Guard against shared layer misuse
+        assert not self._is_kv_shared, (
+            "KV sharing layer should not call _compute_attention_with_metal_zero_copy. "
+            "Shared layers should use PyTorch SDPA with the target layer's KV cache."
+        )
         assert self._metal_kv_cache is not None, "MetalKVCache not initialized"
 
         block_size = self._metal_kv_cache.block_size
