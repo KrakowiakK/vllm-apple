@@ -576,7 +576,6 @@ class MetalEngineContext:
         Raises:
             RuntimeError: If called during ENCODE or SUBMIT phase
         """
-        from Metal import NSMakeRange
         from .guards import EngineHotPathGuard, EnginePhase
 
         # Phase guard: this method breaks "one CB per step" if used in hot path
