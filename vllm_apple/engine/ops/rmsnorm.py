@@ -85,7 +85,7 @@ kernel void rmsnorm_kernel(
     uint thread_idx [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]]
 ) {
-    // Shared memory for reduction
+    // Shared memory for reduction (must be power-of-2 size)
     threadgroup float shared_sum[256];
 
     const uint row_start = token_idx * hidden_size;
@@ -101,9 +101,11 @@ kernel void rmsnorm_kernel(
     shared_sum[thread_idx] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Reduce within threadgroup
+    // Reduce within threadgroup using power-of-2 reduction
+    // threads_per_group MUST be power-of-2 for this to work correctly
+    // (enforced by Python code rounding up to power-of-2)
     for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
-        if (thread_idx < stride) {
+        if (thread_idx < stride && (thread_idx + stride) < threads_per_group) {
             shared_sum[thread_idx] += shared_sum[thread_idx + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -148,8 +150,11 @@ kernel void rmsnorm_residual_kernel(
     shared_sum[thread_idx] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Reduce within threadgroup using power-of-2 reduction
+    // threads_per_group MUST be power-of-2 for this to work correctly
+    // (enforced by Python code rounding up to power-of-2)
     for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
-        if (thread_idx < stride) {
+        if (thread_idx < stride && (thread_idx + stride) < threads_per_group) {
             shared_sum[thread_idx] += shared_sum[thread_idx + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

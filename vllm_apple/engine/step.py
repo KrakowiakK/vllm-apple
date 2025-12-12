@@ -159,8 +159,61 @@ class EngineStepContext:
 
     @property
     def encoder(self) -> Any:
-        """Get the compute encoder for this step."""
+        """Get the compute encoder for this step.
+
+        Note: Prefer get_compute_encoder() for ops that may interleave
+        with MPS operations.
+        """
         return self._encoder
+
+    def get_compute_encoder(self) -> Any:
+        """Get compute encoder, re-opening if needed.
+
+        This method handles the case where the encoder was temporarily
+        ended for MPS operations. If the encoder is closed, it re-opens
+        a new one.
+
+        Returns:
+            MTLComputeCommandEncoder
+
+        Raises:
+            RuntimeError: If not in ENCODE phase
+        """
+        if self._current_phase != EnginePhase.ENCODE:
+            raise RuntimeError("get_compute_encoder only allowed during ENCODE phase")
+
+        if self._encoder is None:
+            # Re-open encoder (was closed for MPS)
+            self._encoder = self._command_buffer.computeCommandEncoder()
+            if self._encoder is None:
+                raise RuntimeError("Failed to re-create compute encoder")
+
+        return self._encoder
+
+    def end_compute_encoder_for_mps(self) -> Any:
+        """End compute encoder to allow MPS encoding.
+
+        MPS operations (MPSMatrixMultiplication, etc.) encode directly to
+        command buffer, not to a compute encoder. This method ends the
+        current encoder and returns the command buffer for MPS use.
+
+        After MPS encoding, call get_compute_encoder() to re-open
+        the compute encoder for further kernel dispatch.
+
+        Returns:
+            MTLCommandBuffer for MPS encoding
+
+        Raises:
+            RuntimeError: If not in ENCODE phase
+        """
+        if self._current_phase != EnginePhase.ENCODE:
+            raise RuntimeError("end_compute_encoder_for_mps only allowed during ENCODE phase")
+
+        if self._encoder is not None:
+            self._encoder.endEncoding()
+            self._encoder = None
+
+        return self._command_buffer
 
     @property
     def is_encoding(self) -> bool:
@@ -290,12 +343,14 @@ class EngineStepContext:
         """End command encoding.
 
         Call this before submit() to finalize the encoder.
+        Safe to call even if encoder was already ended for MPS.
         """
         if self._current_phase != EnginePhase.ENCODE:
             raise RuntimeError("end_encoding only allowed during ENCODE phase")
 
-        self._encoder.endEncoding()
-        self._encoder = None
+        if self._encoder is not None:
+            self._encoder.endEncoding()
+            self._encoder = None
 
         if self._profiler:
             self._profiler.mark_encode_end()

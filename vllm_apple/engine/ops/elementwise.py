@@ -116,25 +116,30 @@ kernel void silu_mul_kernel(
 
 // RoPE (Rotary Position Embedding)
 // Applies rotation to pairs of elements based on position
+// positions buffer contains the actual position ID for each token
 kernel void rope_kernel(
     device half* query [[buffer(0)]],
     device half* key [[buffer(1)]],
     device const float* cos_cache [[buffer(2)]],
     device const float* sin_cache [[buffer(3)]],
-    constant uint& head_size [[buffer(4)]],
-    constant uint& num_heads [[buffer(5)]],
-    constant uint& num_kv_heads [[buffer(6)]],
-    constant uint& rotary_dim [[buffer(7)]],
+    device const int* positions [[buffer(4)]],  // Position ID for each token
+    constant uint& head_size [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& rotary_dim [[buffer(8)]],
     uint3 pos [[thread_position_in_grid]]  // (head_pair_idx, head_idx, token_idx)
 ) {
     uint pair_idx = pos.x;  // Which pair within rotary_dim/2
     uint head_idx = pos.y;  // Which head
-    uint token_idx = pos.z; // Which token
+    uint token_idx = pos.z; // Which token in batch
 
     if (pair_idx >= rotary_dim / 2) return;
 
+    // Get actual position ID for this token (NOT token_idx which is batch order)
+    int position_id = positions[token_idx];
+
     // Get cos/sin for this position and pair
-    uint cache_idx = token_idx * (rotary_dim / 2) + pair_idx;
+    uint cache_idx = position_id * (rotary_dim / 2) + pair_idx;
     float cos_val = cos_cache[cache_idx];
     float sin_val = sin_cache[cache_idx];
 
@@ -547,21 +552,24 @@ class EngineRoPE:
         # Get buffers
         q_buf = query.buffer if isinstance(query, EngineTensor) else query
         k_buf = key.buffer if isinstance(key, EngineTensor) else key
+        pos_buf = positions.buffer if isinstance(positions, EngineTensor) else positions
 
         q_off = query.offset if isinstance(query, EngineTensor) else 0
         k_off = key.offset if isinstance(key, EngineTensor) else 0
+        pos_off = positions.offset if isinstance(positions, EngineTensor) else 0
 
         encoder.setBuffer_offset_atIndex_(q_buf, q_off, 0)
         encoder.setBuffer_offset_atIndex_(k_buf, k_off, 1)
         encoder.setBuffer_offset_atIndex_(self._cos_cache, 0, 2)
         encoder.setBuffer_offset_atIndex_(self._sin_cache, 0, 3)
+        encoder.setBuffer_offset_atIndex_(pos_buf, pos_off, 4)  # Positions buffer
 
-        # Set constants
+        # Set constants (indices shifted by 1 due to positions buffer)
         import struct
-        encoder.setBytes_length_atIndex_(struct.pack("I", self.head_size), 4, 4)
-        encoder.setBytes_length_atIndex_(struct.pack("I", self.num_heads), 4, 5)
-        encoder.setBytes_length_atIndex_(struct.pack("I", self.num_kv_heads), 4, 6)
-        encoder.setBytes_length_atIndex_(struct.pack("I", self.rotary_dim), 4, 7)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.head_size), 4, 5)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.num_heads), 4, 6)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.num_kv_heads), 4, 7)
+        encoder.setBytes_length_atIndex_(struct.pack("I", self.rotary_dim), 4, 8)
 
         # Dispatch
         # Grid: (rotary_dim/2, max(num_heads, num_kv_heads), num_tokens)

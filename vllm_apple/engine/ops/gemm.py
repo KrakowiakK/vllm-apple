@@ -340,10 +340,14 @@ class EngineGEMM:
         # Get kernel
         mm = self._get_mm_kernel(transpose_A, transpose_B, M, K, N, alpha, beta)
 
+        # MPS operations encode directly to command buffer, not to a compute encoder.
+        # We must end any open compute encoder before MPS encoding.
+        cmd_buffer = step_ctx.end_compute_encoder_for_mps()
+
         # Encode to command buffer
         # MPSMatrixMultiplication.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix_
         mm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix_(
-            step_ctx.command_buffer,
+            cmd_buffer,
             A_matrix,
             B_matrix,
             C_matrix,

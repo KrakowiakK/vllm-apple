@@ -165,6 +165,9 @@ class EngineMLP:
             output_buffer: Output buffer [num_tokens, hidden_size]
             num_tokens: Number of tokens
             intermediate_buffer: Optional scratch buffer for intermediate activations.
+                                For standard MLP: single buffer [num_tokens, intermediate_size].
+                                For gated MLP: ignored (always allocates from scratch pool
+                                since 3 separate buffers are needed).
                                 If None, allocates from scratch pool.
         """
         if self._up_proj is None or self._down_proj is None:
@@ -182,12 +185,17 @@ class EngineMLP:
         )
 
         if self.config.gated:
-            # Need two intermediate buffers: gate and up
+            # Gated MLP needs 3 separate buffers, always allocate from scratch
+            # (intermediate_buffer param is ignored for gated MLP)
             gate_intermediate = step_ctx.allocate_scratch(intermediate_size_bytes)
             up_intermediate = step_ctx.allocate_scratch(intermediate_size_bytes)
             fused_intermediate = step_ctx.allocate_scratch(intermediate_size_bytes)
         else:
-            up_intermediate = step_ctx.allocate_scratch(intermediate_size_bytes)
+            # Standard MLP: use provided buffer or allocate
+            if intermediate_buffer is not None:
+                up_intermediate = intermediate_buffer
+            else:
+                up_intermediate = step_ctx.allocate_scratch(intermediate_size_bytes)
 
         if self.config.gated:
             # Gated MLP: silu(gate_proj(x)) * up_proj(x) -> down_proj
