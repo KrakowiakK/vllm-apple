@@ -1166,12 +1166,19 @@ class AppleModelRunner:
             max_num_blocks_per_seq=max_num_blocks_per_seq,
         )
 
+        # CRITICAL: Use attn_metadata.seq_lens which contains FULL sequence lengths
+        # (computed_tokens + new_tokens), NOT model_input.seq_lens which contains
+        # query lengths (number of new tokens per request).
+        # Engine/kernels need full context lengths for:
+        # - max_seq_len calculation for attention
+        # - decode KV-write position (seq_len - 1)
+        # - paged attention context length
         engine_inputs = EngineInputs(
             token_ids=model_input.input_ids.cpu(),
             positions=model_input.positions.cpu(),
             block_table=attn_metadata.block_table.cpu() if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
             slot_mapping=attn_metadata.slot_mapping.cpu() if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
-            seq_lens=torch.tensor(model_input.seq_lens, dtype=torch.int32),
+            seq_lens=attn_metadata.seq_lens.cpu().to(torch.int32),
         )
 
         # Execute via engine runner
