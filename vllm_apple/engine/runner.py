@@ -344,6 +344,13 @@ class EngineRunner:
             max_blocks_per_seq = (max_seq_len + self._kv_cache.block_size - 1) // self._kv_cache.block_size if max_seq_len > 0 else 1
 
         # Validate inputs before encoding to prevent OOB writes
+        # Always validate block_table to catch seq_lens/block_table inconsistencies
+        if inputs.block_table.numel() > 0:
+            self._kv_cache.validate_block_table(
+                inputs.block_table,
+                context=f"step {self._step_counter}"
+            )
+
         # For prefill, validate slot_mapping is within KV cache capacity
         if step_desc.is_prefill and inputs.slot_mapping.numel() > 0:
             self._kv_cache.validate_slot_mapping(
@@ -591,6 +598,7 @@ class EngineRunner:
             output_buffer=attn_output_buffer,
             num_seqs=num_seqs,
             max_seq_len=max_seq_len,
+            max_blocks_per_seq=max_blocks_per_seq,  # Computed from actual block_table shape
         )
 
         step_ctx.memory_barrier()
