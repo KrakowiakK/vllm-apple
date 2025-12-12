@@ -1141,17 +1141,29 @@ class AppleModelRunner:
         # Convert AppleModelInput to EngineInputs
         attn_metadata = model_input.attn_metadata
 
-        # Derive step_kind from attn_metadata
-        # num_prefills > 0 indicates prefill requests in the batch
-        # This is set by the attention backend during input preparation
-        step_kind = "prefill" if attn_metadata.num_prefills > 0 else "decode"
+        # Derive step_kind from attn_metadata using available attributes
+        # MetalAttentionMetadata has: num_actual_tokens, num_decode_tokens
+        # Pure decode: num_decode_tokens == num_actual_tokens
+        # Has prefill: num_decode_tokens < num_actual_tokens
+        has_prefill = attn_metadata.num_decode_tokens < attn_metadata.num_actual_tokens
+        step_kind = "prefill" if has_prefill else "decode"
+
+        # Derive num_seqs from model_input (reliable, always available)
+        num_seqs_active = model_input.num_reqs
+
+        # Derive max_num_blocks_per_seq from block_table shape
+        # block_table shape is [num_seqs, max_blocks_per_seq]
+        if attn_metadata.block_table is not None and attn_metadata.block_table.numel() > 0:
+            max_num_blocks_per_seq = attn_metadata.block_table.shape[1]
+        else:
+            max_num_blocks_per_seq = 0
 
         step_desc = StepDescriptor(
             step_id=0,  # Will be tracked by runner
             step_kind=step_kind,
             num_scheduled_tokens=model_input.num_scheduled_tokens,
-            num_seqs_active=attn_metadata.num_seqs,
-            max_num_blocks_per_seq=attn_metadata.max_num_blocks_per_seq if hasattr(attn_metadata, 'max_num_blocks_per_seq') else 0,
+            num_seqs_active=num_seqs_active,
+            max_num_blocks_per_seq=max_num_blocks_per_seq,
         )
 
         engine_inputs = EngineInputs(
@@ -1211,6 +1223,15 @@ class AppleModelRunner:
             num_reqs = model_input.num_reqs
             if hidden_states.shape[0] != num_reqs:
                 # Prefill: engine returns [num_tokens, vocab_size], extract last token per seq
+                # Invariant check: sum(seq_lens) must equal num_tokens for correct indexing
+                expected_tokens = sum(model_input.seq_lens)
+                actual_tokens = hidden_states.shape[0]
+                if expected_tokens != actual_tokens:
+                    raise ValueError(
+                        f"Engine logits shape mismatch: sum(seq_lens)={expected_tokens} "
+                        f"but got {actual_tokens} tokens. This indicates token packing "
+                        f"inconsistency between engine and model_input."
+                    )
                 last_token_positions = []
                 current_pos = 0
                 for seq_len in model_input.seq_lens:
