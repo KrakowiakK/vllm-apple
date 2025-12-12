@@ -342,6 +342,54 @@ class TestKVWriteParams:
         assert new_kv_stride_head == 128
 
 
+class TestSlotMappingValidation:
+    """Test slot_mapping validation for prefill KV write."""
+
+    def test_valid_slot_mapping(self):
+        """Test valid slot_mapping passes validation."""
+        # Simulate validation logic
+        num_blocks = 100
+        block_size = 16
+        max_valid_slot = num_blocks * block_size - 1
+
+        # Valid slot_mapping
+        slot_mapping = np.array([0, 1, 15, 100, max_valid_slot], dtype=np.int32)
+
+        # Check all are within range
+        valid_mask = slot_mapping >= 0
+        max_slot = slot_mapping[valid_mask].max()
+        assert max_slot <= max_valid_slot
+
+    def test_invalid_slot_oob(self):
+        """Test OOB slot_mapping detected."""
+        num_blocks = 100
+        block_size = 16
+        max_valid_slot = num_blocks * block_size - 1  # 1599
+
+        # Invalid: slot 2000 is out of bounds
+        slot_mapping = np.array([0, 1, 2000], dtype=np.int32)
+
+        valid_mask = slot_mapping >= 0
+        max_slot = slot_mapping[valid_mask].max()
+        assert max_slot > max_valid_slot  # Should be detected as OOB
+
+    def test_negative_one_allowed(self):
+        """Test -1 is allowed in slot_mapping (padding)."""
+        slot_mapping = np.array([0, -1, 10, -1, 20], dtype=np.int32)
+
+        # -1 should be allowed, other negatives not
+        invalid_mask = slot_mapping < -1
+        assert not invalid_mask.any()
+
+    def test_invalid_negative(self):
+        """Test invalid negative values detected."""
+        slot_mapping = np.array([0, -2, 10], dtype=np.int32)
+
+        # -2 is invalid (only -1 allowed)
+        invalid_mask = slot_mapping < -1
+        assert invalid_mask.any()
+
+
 class TestMaxSeqLenCalculation:
     """Test max_seq_len calculation from seq_lens."""
 

@@ -317,6 +317,65 @@ class EngineKVCache:
                 f"{' (' + context + ')' if context else ''}"
             )
 
+    def validate_slot_mapping(
+        self,
+        slot_mapping: "Union[np.ndarray, torch.Tensor]",
+        context: str = "",
+    ) -> None:
+        """Validate slot_mapping indices are within KV cache capacity.
+
+        This should be called before prefill KV write to ensure that
+        all slot indices are valid. Invalid indices would cause GPU errors
+        or incorrect results (OOB write to KV cache).
+
+        Args:
+            slot_mapping: Slot mapping [num_tokens]
+            context: Context string for error messages
+
+        Raises:
+            ValueError: If any slot index is out of range
+            RuntimeError: If slot_mapping is on MPS device in strict mode
+        """
+        import torch
+        from .strict_mode import is_strict_mode
+
+        if isinstance(slot_mapping, torch.Tensor):
+            if slot_mapping.device.type == 'cpu':
+                slot_mapping = slot_mapping.numpy()
+            elif slot_mapping.device.type == 'mps':
+                if is_strict_mode():
+                    raise RuntimeError(
+                        f"MPS tensor passed to validate_slot_mapping() in strict mode. "
+                        f"Device: {slot_mapping.device}. "
+                        f"Slot mapping must be on CPU BEFORE reaching engine boundary."
+                    )
+                slot_mapping = slot_mapping.cpu().numpy()
+            else:
+                raise ValueError(f"Unsupported device type: {slot_mapping.device.type}")
+
+        # Total capacity is num_blocks * block_size slots
+        max_valid_slot = self._desc.num_blocks * self._desc.block_size - 1
+
+        # Check for out-of-range indices (ignore -1 which means padding/invalid)
+        valid_mask = slot_mapping >= 0
+        if valid_mask.any():
+            max_slot = slot_mapping[valid_mask].max()
+            if max_slot > max_valid_slot:
+                raise ValueError(
+                    f"Slot mapping contains index {max_slot} > max valid slot {max_valid_slot} "
+                    f"(num_blocks={self._desc.num_blocks}, block_size={self._desc.block_size})"
+                    f"{' (' + context + ')' if context else ''}"
+                )
+
+        # Check for invalid negative values (only -1 is allowed)
+        invalid_mask = (slot_mapping < -1)
+        if invalid_mask.any():
+            invalid_idx = slot_mapping[invalid_mask].min()
+            raise ValueError(
+                f"Slot mapping contains invalid index {invalid_idx}"
+                f"{' (' + context + ')' if context else ''}"
+            )
+
     def get_block_offset(self, block_id: int) -> int:
         """Get byte offset for a block.
 

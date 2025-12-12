@@ -404,5 +404,6 @@ class KVWriteOp:
             "num_kv_heads": self.num_kv_heads,
             "head_size": self.head_size,
             "block_size": self.block_size,
-            "kernel": self._kernel_name,
+            "decode_kernel": "kv_write_decode",
+            "prefill_kernel": "kv_write_prefill",
         }

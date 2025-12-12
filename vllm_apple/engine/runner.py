@@ -335,6 +335,22 @@ class EngineRunner:
         # This is more reliable than step_desc.max_num_blocks_per_seq which may be 0
         max_seq_len = int(inputs.seq_lens.max().item()) if inputs.seq_lens.numel() > 0 else 0
 
+        # Compute max_blocks_per_seq from actual block_table shape
+        # block_table is [num_seqs, max_blocks_per_seq] - use actual shape to avoid OOB
+        if inputs.block_table.ndim == 2 and inputs.block_table.shape[1] > 0:
+            max_blocks_per_seq = inputs.block_table.shape[1]
+        else:
+            # Fallback: compute from max_seq_len and block_size
+            max_blocks_per_seq = (max_seq_len + self._kv_cache.block_size - 1) // self._kv_cache.block_size if max_seq_len > 0 else 1
+
+        # Validate inputs before encoding to prevent OOB writes
+        # For prefill, validate slot_mapping is within KV cache capacity
+        if step_desc.is_prefill and inputs.slot_mapping.numel() > 0:
+            self._kv_cache.validate_slot_mapping(
+                inputs.slot_mapping,
+                context=f"step {self._step_counter} prefill"
+            )
+
         # Create step context
         with EngineStepContext(
             engine_context=self._context,
@@ -532,8 +548,7 @@ class EngineRunner:
 
         if step_desc.is_decode:
             # Decode: single token per sequence
-            # max_blocks_per_seq is the second dim of block_table
-            max_blocks_per_seq = step_desc.max_num_blocks_per_seq if step_desc.max_num_blocks_per_seq > 0 else 128
+            # max_blocks_per_seq computed earlier from actual block_table shape
             layer_ops.kv_write.encode_decode(
                 step_ctx=step_ctx,
                 new_keys_buffer=new_k_tensor.buffer,
