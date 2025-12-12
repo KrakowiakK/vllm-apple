@@ -52,7 +52,11 @@ where = ["."]
 include = ["vllm_apple*"]
 
 [tool.setuptools.package-data]
-vllm_apple = ["extension/kernels/*.metal", "extension/compiled/*.metallib"]
+vllm_apple = [
+    "metal/kernels/*.metal",
+    "metal/native/*.dylib",
+    "ops/metal/*.metal"
+]
 
 [tool.black]
 line-length = 88
