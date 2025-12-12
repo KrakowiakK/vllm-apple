@@ -88,25 +88,28 @@ from .descriptors import (
     ModelDescriptor,
 )
 
+# Direct class imports (for type hints and direct instantiation)
+from .context import MetalEngineContext
+from .step import EngineStepContext
+from .kv_cache import EngineKVCache
+from .runner import EngineRunner
+from .weight_loader import EngineWeightLoader
+
 # Lazy imports for heavy modules (avoid import at module load)
 def get_engine_context():
     """Get the global Metal engine context."""
-    from .context import MetalEngineContext
     return MetalEngineContext.get_instance()
 
 def create_step_context(*args, **kwargs):
     """Create a step execution context."""
-    from .step import EngineStepContext
     return EngineStepContext(*args, **kwargs)
 
 def create_engine_runner(*args, **kwargs):
     """Create an engine runner."""
-    from .runner import EngineRunner
     return EngineRunner(*args, **kwargs)
 
 def create_weight_loader(*args, **kwargs):
     """Create a weight loader."""
-    from .weight_loader import EngineWeightLoader
     return EngineWeightLoader(*args, **kwargs)
 
 __all__ = [
@@ -144,6 +147,12 @@ __all__ = [
     "EngineOutputs",
     "KVCacheDescriptor",
     "ModelDescriptor",
+    # Core classes
+    "MetalEngineContext",
+    "EngineStepContext",
+    "EngineKVCache",
+    "EngineRunner",
+    "EngineWeightLoader",
     # Context helpers
     "get_engine_context",
     "create_step_context",

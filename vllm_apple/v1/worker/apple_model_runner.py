@@ -53,7 +53,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.utils import bind_kv_cache
 
 # Engine mode imports (v2.0 Metal engine)
-from vllm_apple.engine import is_engine_mode_enabled
+from vllm_apple.engine import is_engine_mode_enabled, is_strict_mode
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -556,7 +556,10 @@ class AppleModelRunner:
             )
 
         # Execute forward pass
-        hidden_states = self._execute_forward(model_input)
+        # Returns tuple (output, is_logits) where:
+        # - PyTorch path: (hidden_states, False)
+        # - Engine path: (logits, True)
+        forward_output, is_logits = self._execute_forward(model_input, scheduler_output)
 
         if self._timing_enabled:
             if hasattr(torch.mps, 'synchronize'):
@@ -564,7 +567,7 @@ class AppleModelRunner:
             t3 = time.time()
 
         # Sample tokens from the model output
-        output = self._sample_tokens(hidden_states, model_input, scheduler_output)
+        output = self._sample_tokens(forward_output, model_input, scheduler_output, is_logits=is_logits)
 
         if self._timing_enabled:
             t4 = time.time()
@@ -1068,7 +1071,8 @@ class AppleModelRunner:
     def _execute_forward(
         self,
         model_input: AppleModelInput,
-    ) -> torch.Tensor:
+        scheduler_output: "SchedulerOutput" = None,
+    ) -> tuple[torch.Tensor, bool]:
         """Execute the model forward pass.
 
         The forward context provides access to KV caches, so we don't
@@ -1076,13 +1080,30 @@ class AppleModelRunner:
 
         Args:
             model_input: Prepared model input
+            scheduler_output: Scheduler output (needed for engine mode step_kind)
 
         Returns:
-            Hidden states from the model [num_tokens, hidden_size]
+            Tuple of (output_tensor, is_logits):
+            - PyTorch path: (hidden_states [num_tokens, hidden_size], False)
+            - Engine path: (logits [num_reqs, vocab_size], True)
         """
         # Engine mode path (v2.0 Metal engine)
-        if self._use_engine_mode and self._engine_runner is not None:
-            return self._execute_forward_engine(model_input)
+        if self._use_engine_mode:
+            if self._engine_runner is not None:
+                return self._execute_forward_engine(model_input, scheduler_output), True
+            else:
+                # Engine mode enabled but runner not initialized
+                if is_strict_mode():
+                    raise RuntimeError(
+                        "Engine mode enabled (VLLM_APPLE_USE_ENGINE=1) but engine runner "
+                        "not initialized. In strict mode (VLLM_METAL_STRICT_NO_MPS=1), "
+                        "silent fallback to PyTorch/MPS is not allowed. "
+                        "Ensure model weights are loaded to engine before inference."
+                    )
+                logger.warning(
+                    "Engine mode enabled but runner not initialized - "
+                    "falling back to PyTorch/MPS path"
+                )
 
         # Standard PyTorch path
         # Set forward context - attention layers access KV caches through this
@@ -1097,11 +1118,12 @@ class AppleModelRunner:
                 positions=model_input.positions,
             )
 
-        return hidden_states
+        return hidden_states, False
 
     def _execute_forward_engine(
         self,
         model_input: AppleModelInput,
+        scheduler_output: "SchedulerOutput" = None,
     ) -> torch.Tensor:
         """Execute forward pass using v2.0 Metal engine.
 
@@ -1110,18 +1132,36 @@ class AppleModelRunner:
 
         Args:
             model_input: Prepared model input
+            scheduler_output: Scheduler output for step_kind derivation
 
         Returns:
-            Hidden states from the model [num_tokens, hidden_size]
+            Logits from the model [num_reqs, vocab_size]
+            (Engine computes LM head internally)
         """
         from vllm_apple.engine import StepDescriptor, EngineInputs
 
         # Convert AppleModelInput to EngineInputs
         attn_metadata = model_input.attn_metadata
 
+        # Derive step_kind from scheduler output for correctness in mixed batches
+        # Pure prefill: all requests have num_computed_tokens == 0
+        # Pure decode: all requests have num_computed_tokens > 0
+        # Mixed: some prefill, some decode - treat as prefill (more conservative)
+        if scheduler_output is not None:
+            num_prefill_reqs = sum(
+                1 for req in scheduler_output.scheduled_new_reqs
+            ) + sum(
+                1 for req in scheduler_output.scheduled_cached_reqs
+                if req.num_computed_tokens == 0
+            )
+            step_kind = "prefill" if num_prefill_reqs > 0 else "decode"
+        else:
+            # Fallback: use attn_metadata heuristic
+            step_kind = "prefill" if attn_metadata.num_prefills > 0 else "decode"
+
         step_desc = StepDescriptor(
             step_id=0,  # Will be tracked by runner
-            step_kind="prefill" if attn_metadata.num_prefills > 0 else "decode",
+            step_kind=step_kind,
             num_scheduled_tokens=model_input.num_scheduled_tokens,
             num_seqs_active=attn_metadata.num_seqs,
             max_num_blocks_per_seq=attn_metadata.max_num_blocks_per_seq if hasattr(attn_metadata, 'max_num_blocks_per_seq') else 0,
@@ -1138,8 +1178,8 @@ class AppleModelRunner:
         # Execute via engine runner
         outputs = self._engine_runner.execute_step(step_desc, engine_inputs)
 
-        # Return logits as hidden states (engine already computed LM head)
-        # The caller (_sample_tokens) will handle sampling
+        # Return logits directly (engine already computed LM head)
+        # The caller will skip LM head when is_logits=True
         return outputs.logits.to(self.device)
 
     def _sample_tokens(
@@ -1147,20 +1187,22 @@ class AppleModelRunner:
         hidden_states: torch.Tensor,
         model_input: AppleModelInput,
         scheduler_output: "SchedulerOutput",
+        is_logits: bool = False,
     ) -> ModelRunnerOutput:
         """Sample tokens from model output.
 
         This method:
-        1. Extracts logits from hidden states
-        2. Applies the language model head
+        1. Extracts logits from hidden states (or uses logits directly if is_logits=True)
+        2. Applies the language model head (skipped if is_logits=True)
         3. Uses the sampler to generate tokens
         4. Updates request states
         5. Returns ModelRunnerOutput
 
         Args:
-            hidden_states: Model output hidden states
+            hidden_states: Model output hidden states, or logits if is_logits=True
             model_input: Input that was used
             scheduler_output: Scheduler output
+            is_logits: If True, hidden_states are already logits (skip LM head)
 
         Returns:
             ModelRunnerOutput with sampled tokens
@@ -1175,38 +1217,43 @@ class AppleModelRunner:
                 pooler_output=[],
             )
 
-        # Calculate positions of last tokens
-        last_token_positions = []
-        current_pos = 0
-        for seq_len in model_input.seq_lens:
-            last_token_positions.append(current_pos + seq_len - 1)
-            current_pos += seq_len
-
-        # Extract hidden states at last token positions
-        if hidden_states.dim() == 2:
-            # [num_tokens, hidden_size]
-            logits_hidden = hidden_states[last_token_positions]
+        # If is_logits=True, hidden_states are already logits [num_reqs, vocab_size]
+        # from engine mode - skip extraction and LM head
+        if is_logits:
+            logits = hidden_states
         else:
-            # Handle other shapes
-            hidden_states = hidden_states.view(-1, hidden_states.size(-1))
-            logits_hidden = hidden_states[last_token_positions]
+            # Calculate positions of last tokens
+            last_token_positions = []
+            current_pos = 0
+            for seq_len in model_input.seq_lens:
+                last_token_positions.append(current_pos + seq_len - 1)
+                current_pos += seq_len
 
-        # Apply language model head to get logits
-        # Use compute_logits method if available (vLLM models use this)
-        if hasattr(self.model, "compute_logits"):
-            logits = self.model.compute_logits(logits_hidden)
-        elif hasattr(self.model, "logits_processor") and hasattr(self.model, "lm_head"):
-            # Use logits_processor if available
-            logits = self.model.logits_processor(self.model.lm_head, logits_hidden)
-        elif hasattr(self.model, "lm_head"):
-            # Fallback: directly access lm_head weight for linear projection
-            lm_head_weight = self.model.lm_head.weight
-            logits = torch.nn.functional.linear(logits_hidden, lm_head_weight)
-        elif hasattr(self.model, "output"):
-            logits = self.model.output(logits_hidden)
-        else:
-            # Assume hidden states are already logits
-            logits = logits_hidden
+            # Extract hidden states at last token positions
+            if hidden_states.dim() == 2:
+                # [num_tokens, hidden_size]
+                logits_hidden = hidden_states[last_token_positions]
+            else:
+                # Handle other shapes
+                hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+                logits_hidden = hidden_states[last_token_positions]
+
+            # Apply language model head to get logits
+            # Use compute_logits method if available (vLLM models use this)
+            if hasattr(self.model, "compute_logits"):
+                logits = self.model.compute_logits(logits_hidden)
+            elif hasattr(self.model, "logits_processor") and hasattr(self.model, "lm_head"):
+                # Use logits_processor if available
+                logits = self.model.logits_processor(self.model.lm_head, logits_hidden)
+            elif hasattr(self.model, "lm_head"):
+                # Fallback: directly access lm_head weight for linear projection
+                lm_head_weight = self.model.lm_head.weight
+                logits = torch.nn.functional.linear(logits_hidden, lm_head_weight)
+            elif hasattr(self.model, "output"):
+                logits = self.model.output(logits_hidden)
+            else:
+                # Assume hidden states are already logits
+                logits = logits_hidden
 
         # Use the sampler to generate tokens
         # For simplicity, we'll do manual sampling here
