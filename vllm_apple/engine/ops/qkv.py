@@ -300,22 +300,22 @@ class EngineQKVProjection:
         step_ctx.memory_barrier()
 
         # Return info about Q, K, V locations in output
-        # These are byte offsets into the output buffer
+        # These are byte offsets into the qkv_output buffer
         element_size = 2  # float16
         q_info = {
-            'buffer': output_buffer,
+            'buffer': qkv_output,
             'offset': 0,
             'shape': (num_tokens, self.config.num_heads, self.config.head_size),
             'size_bytes': num_tokens * self.config.q_size * element_size,
         }
         k_info = {
-            'buffer': output_buffer,
+            'buffer': qkv_output,
             'offset': num_tokens * self.config.q_size * element_size,
             'shape': (num_tokens, self.config.num_kv_heads, self.config.head_size),
             'size_bytes': num_tokens * self.config.k_size * element_size,
         }
         v_info = {
-            'buffer': output_buffer,
+            'buffer': qkv_output,
             'offset': num_tokens * (self.config.q_size + self.config.k_size) * element_size,
             'shape': (num_tokens, self.config.num_kv_heads, self.config.head_size),
             'size_bytes': num_tokens * self.config.v_size * element_size,

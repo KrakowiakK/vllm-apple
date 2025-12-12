@@ -309,6 +309,9 @@ kernel void rmsnorm_residual_kernel(
         # Use 256 threads per group for reduction
         threads_per_group = min(256, self.config.hidden_size)
         threads_per_group = max(32, threads_per_group)  # At least 32
+        # Round up to next power of 2 for reduction correctness
+        # The Metal kernel uses power-of-2 parallel reduction
+        threads_per_group = 1 << (threads_per_group - 1).bit_length()
 
         thread_groups = MTLSize(num_tokens, 1, 1)
         threads_per_threadgroup = MTLSize(threads_per_group, 1, 1)

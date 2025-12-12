@@ -218,6 +218,7 @@ class EngineElementwiseOps:
 
         # Get all pipelines
         kernel_names = [
+            "copy_kernel",
             "residual_add_kernel",
             "residual_add_inplace_kernel",
             "silu_kernel",
@@ -569,8 +570,9 @@ class EngineRoPE:
         step_ctx: Any,
         query: Union[EngineTensor, Any],
         key: Union[EngineTensor, Any],
-        positions: Union[EngineTensor, Any],  # [num_tokens] position indices
+        positions: Union[EngineTensor, Any],  # [num_tokens] position indices (int32)
         num_tokens: int,
+        max_position_in_batch: Optional[int] = None,  # For bounds checking
     ) -> None:
         """Encode RoPE to command buffer.
 
@@ -580,11 +582,24 @@ class EngineRoPE:
             step_ctx: EngineStepContext
             query: Query tensor [num_tokens, num_heads, head_size]
             key: Key tensor [num_tokens, num_kv_heads, head_size]
-            positions: Position indices [num_tokens]
+            positions: Position indices [num_tokens] - MUST be int32 dtype
             num_tokens: Number of tokens
+            max_position_in_batch: Maximum position ID in this batch (for bounds check)
+
+        Note:
+            The positions buffer must contain int32 values. The kernel reads these
+            as position IDs to index into the cos/sin cache. Position IDs must be
+            less than max_position (checked if max_position_in_batch is provided).
         """
         if not step_ctx.is_encoding:
             raise RuntimeError("encode() called outside ENCODE phase")
+
+        # Range check: position_id must be < max_position to stay within cache bounds
+        if max_position_in_batch is not None and max_position_in_batch >= self.max_position:
+            raise ValueError(
+                f"Position ID {max_position_in_batch} exceeds max_position {self.max_position}. "
+                f"Increase max_position in EngineRoPE constructor."
+            )
 
         encoder = step_ctx.get_compute_encoder()
         encoder.setComputePipelineState_(self._pipeline)

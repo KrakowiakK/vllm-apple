@@ -332,12 +332,17 @@ class EngineStepContext:
 
         Call this between operations that have producer-consumer dependency
         on the same buffers.
+
+        Note: If the encoder was closed for MPS operations, this will
+        re-open it to insert the barrier.
         """
         if self._current_phase != EnginePhase.ENCODE:
             raise RuntimeError("memory_barrier only allowed during ENCODE phase")
 
         if HAS_METAL and MTLBarrierScopeBuffers is not None:
-            self._encoder.memoryBarrierWithScope_(MTLBarrierScopeBuffers)
+            # Re-open encoder if it was closed for MPS
+            encoder = self.get_compute_encoder()
+            encoder.memoryBarrierWithScope_(MTLBarrierScopeBuffers)
 
     def end_encoding(self) -> None:
         """End command encoding.

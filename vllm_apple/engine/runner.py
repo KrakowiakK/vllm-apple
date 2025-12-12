@@ -164,14 +164,18 @@ class EngineRunner:
                 rope=EngineRoPE(
                     context=self._context,
                     head_size=md.head_size,
-                    max_seq_len=md.max_position_embeddings,
-                    rope_theta=md.rope_theta,
+                    num_heads=md.num_attention_heads,
+                    num_kv_heads=md.num_kv_heads,
+                    rotary_dim=None,  # Default to head_size
+                    max_position=md.max_position_embeddings,
+                    base=md.rope_theta,
                 ),
                 attention=PagedAttentionOp(
                     context=self._context,
-                    num_heads=md.num_attention_heads,
                     num_kv_heads=md.num_kv_heads,
+                    num_query_heads=md.num_attention_heads,
                     head_size=md.head_size,
+                    block_size=self._kv_cache.block_size,
                     scale=1.0 / (md.head_size ** 0.5),
                 ),
                 kv_write=KVWriteOp(
@@ -311,11 +315,19 @@ class EngineRunner:
             )
 
         # Copy inputs to GPU buffers
+        # Ensure proper dtypes: positions, slot_mapping, seq_lens must be int32 for Metal kernels
         token_ids_buffer = self._copy_to_buffer(inputs.token_ids, "token_ids")
-        positions_buffer = self._copy_to_buffer(inputs.positions, "positions")
-        block_table_buffer = self._copy_to_buffer(inputs.block_table, "block_table")
-        slot_mapping_buffer = self._copy_to_buffer(inputs.slot_mapping, "slot_mapping")
-        seq_lens_buffer = self._copy_to_buffer(inputs.seq_lens, "seq_lens")
+        positions_int32 = inputs.positions.to(torch.int32) if inputs.positions.dtype != torch.int32 else inputs.positions
+        positions_buffer = self._copy_to_buffer(positions_int32, "positions")
+        block_table_int32 = inputs.block_table.to(torch.int32) if inputs.block_table.dtype != torch.int32 else inputs.block_table
+        block_table_buffer = self._copy_to_buffer(block_table_int32, "block_table")
+        slot_mapping_int32 = inputs.slot_mapping.to(torch.int32) if inputs.slot_mapping.dtype != torch.int32 else inputs.slot_mapping
+        slot_mapping_buffer = self._copy_to_buffer(slot_mapping_int32, "slot_mapping")
+        seq_lens_int32 = inputs.seq_lens.to(torch.int32) if inputs.seq_lens.dtype != torch.int32 else inputs.seq_lens
+        seq_lens_buffer = self._copy_to_buffer(seq_lens_int32, "seq_lens")
+
+        # Compute max position for RoPE bounds checking
+        max_position_in_batch = int(inputs.positions.max().item()) if num_tokens > 0 else 0
 
         # Create step context
         with EngineStepContext(
@@ -358,6 +370,7 @@ class EngineRunner:
                     num_tokens=num_tokens,
                     num_seqs=step_desc.num_seqs_active,
                     step_desc=step_desc,
+                    max_position_in_batch=max_position_in_batch,
                 )
 
             # Final norm
@@ -404,6 +417,7 @@ class EngineRunner:
         num_tokens: int,
         num_seqs: int,
         step_desc: StepDescriptor,
+        max_position_in_batch: int,
     ) -> Tuple[Any, Any]:
         """Encode a single transformer layer.
 
@@ -413,13 +427,14 @@ class EngineRunner:
             layer_ops: Layer operations
             hidden_states: Input hidden states buffer
             residual_buffer: Buffer for residual connection
-            positions_buffer: Position IDs buffer
-            block_table_buffer: Block table buffer
-            slot_mapping_buffer: Slot mapping buffer
-            seq_lens_buffer: Sequence lengths buffer
+            positions_buffer: Position IDs buffer (int32)
+            block_table_buffer: Block table buffer (int32)
+            slot_mapping_buffer: Slot mapping buffer (int32)
+            seq_lens_buffer: Sequence lengths buffer (int32)
             num_tokens: Number of tokens
             num_seqs: Number of sequences
             step_desc: Step descriptor
+            max_position_in_batch: Maximum position ID for RoPE bounds check
 
         Returns:
             Tuple of (new_hidden_states, new_residual_buffer)
@@ -464,49 +479,88 @@ class EngineRunner:
         q_size = num_tokens * md.num_attention_heads * md.head_size
         k_size = num_tokens * md.num_kv_heads * md.head_size
 
-        # Create views into QKV buffer
+        # Create views into QKV buffer using EngineTensor for K
         q_buffer = qkv_buffer  # Q is at start
-        k_offset = q_size * 2  # After Q (in bytes, float16)
-        # V is at k_offset + k_size * 2
+        k_offset_bytes = q_size * 2  # After Q (in bytes, float16)
+        v_offset_bytes = k_offset_bytes + k_size * 2
+
+        # Create EngineTensor view for K at offset
+        k_tensor = EngineTensor(
+            buffer=qkv_buffer,
+            shape=(num_tokens, md.num_kv_heads, md.head_size),
+            dtype=EngineDType.FLOAT16,
+            offset=k_offset_bytes,
+        )
 
         layer_ops.rope.encode(
             step_ctx=step_ctx,
             query=qkv_buffer,
-            key=qkv_buffer,
-            key_offset=k_offset,
+            key=k_tensor,
             positions=positions_buffer,
             num_tokens=num_tokens,
-            num_heads=md.num_attention_heads,
-            num_kv_heads=md.num_kv_heads,
+            max_position_in_batch=max_position_in_batch,
         )
 
         step_ctx.memory_barrier()
 
         # 4. Write K, V to cache
-        layer_ops.kv_write.encode(
-            step_ctx=step_ctx,
-            k_buffer=qkv_buffer,
-            v_buffer=qkv_buffer,
-            k_offset=k_offset,
-            v_offset=k_offset + k_size * 2,
-            slot_mapping=slot_mapping_buffer,
-            kv_cache=self._kv_cache.get_layer_cache(layer_idx),
-            num_tokens=num_tokens,
+        # Get KV cache buffers for this layer
+        k_cache, v_cache = self._kv_cache.get_layer_cache(layer_idx)
+
+        # Create EngineTensor views for new K and V
+        new_k_tensor = EngineTensor(
+            buffer=qkv_buffer,
+            shape=(num_tokens, md.num_kv_heads, md.head_size),
+            dtype=EngineDType.FLOAT16,
+            offset=k_offset_bytes,
         )
+        new_v_tensor = EngineTensor(
+            buffer=qkv_buffer,
+            shape=(num_tokens, md.num_kv_heads, md.head_size),
+            dtype=EngineDType.FLOAT16,
+            offset=v_offset_bytes,
+        )
+
+        if step_desc.is_decode:
+            # Decode: single token per sequence
+            layer_ops.kv_write.encode_decode(
+                step_ctx=step_ctx,
+                new_keys_buffer=new_k_tensor.buffer,
+                new_values_buffer=new_v_tensor.buffer,
+                key_buffer=k_cache,
+                value_buffer=v_cache,
+                block_table_buffer=block_table_buffer,
+                seq_lens_buffer=seq_lens_buffer,
+                num_seqs=num_seqs,
+            )
+        else:
+            # Prefill: multiple tokens
+            layer_ops.kv_write.encode_prefill(
+                step_ctx=step_ctx,
+                new_keys_buffer=new_k_tensor.buffer,
+                new_values_buffer=new_v_tensor.buffer,
+                key_buffer=k_cache,
+                value_buffer=v_cache,
+                slot_mapping_buffer=slot_mapping_buffer,
+                num_tokens=num_tokens,
+            )
 
         step_ctx.memory_barrier()
 
         # 5. Attention
+        # Compute max_seq_len from seq_lens (TODO: pass from step_desc)
+        max_seq_len = step_desc.max_num_blocks_per_seq * self._kv_cache.block_size
+
         layer_ops.attention.encode(
             step_ctx=step_ctx,
-            query=qkv_buffer,
-            kv_cache=self._kv_cache.get_layer_cache(layer_idx),
-            block_table=block_table_buffer,
-            seq_lens=seq_lens_buffer,
-            output=attn_output_buffer,
-            num_tokens=num_tokens,
+            query_buffer=qkv_buffer,
+            key_buffer=k_cache,
+            value_buffer=v_cache,
+            block_table_buffer=block_table_buffer,
+            seq_lens_buffer=seq_lens_buffer,
+            output_buffer=attn_output_buffer,
             num_seqs=num_seqs,
-            is_prefill=step_desc.is_prefill,
+            max_seq_len=max_seq_len,
         )
 
         step_ctx.memory_barrier()
@@ -515,7 +569,7 @@ class EngineRunner:
         layer_ops.o_proj.encode(
             step_ctx=step_ctx,
             attn_output=attn_output_buffer,
-            output=hidden_states,
+            output_buffer=hidden_states,
             num_tokens=num_tokens,
         )
 
