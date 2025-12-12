@@ -228,7 +228,11 @@ class EngineRunner:
             lw = w.layers[layer_idx]
 
             layer_ops.input_norm.set_weights(lw.input_layernorm)
-            layer_ops.qkv_proj.set_weights(lw.q_proj, lw.k_proj, lw.v_proj)
+            layer_ops.qkv_proj.set_weights(
+                q_weight=lw.q_proj,
+                k_weight=lw.k_proj,
+                v_weight=lw.v_proj,
+            )
             layer_ops.o_proj.set_weights(lw.o_proj)
             layer_ops.post_attn_norm.set_weights(lw.post_attention_layernorm)
             layer_ops.mlp.set_weights(

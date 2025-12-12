@@ -129,8 +129,11 @@ class EngineQKVProjection:
             has_bias=bias_buffer is not None,
         )
 
-        # Store weights
-        self._weight_buffer = weight_buffer
+        # Store weights (fused or separate)
+        self._weight_buffer = weight_buffer  # Fused QKV weights
+        self._q_weight = None  # Separate Q weight
+        self._k_weight = None  # Separate K weight
+        self._v_weight = None  # Separate V weight
         self._bias_buffer = bias_buffer
 
         # Create GEMM op
@@ -149,57 +152,144 @@ class EngineQKVProjection:
 
     def set_weights(
         self,
-        weight_buffer: Any,
+        q_weight: Optional[Any] = None,  # MTLBuffer [q_size, hidden_size]
+        k_weight: Optional[Any] = None,  # MTLBuffer [k_size, hidden_size]
+        v_weight: Optional[Any] = None,  # MTLBuffer [v_size, hidden_size]
+        qkv_weight: Optional[Any] = None,  # Fused [qkv_size, hidden_size]
         bias_buffer: Optional[Any] = None,
     ) -> None:
         """Set weight buffers.
 
+        Can set either separate Q, K, V weights OR a fused QKV weight.
+
         Args:
-            weight_buffer: W_qkv [hidden_size, qkv_size]
+            q_weight: Q projection [q_size, hidden_size] (transposed)
+            k_weight: K projection [k_size, hidden_size] (transposed)
+            v_weight: V projection [v_size, hidden_size] (transposed)
+            qkv_weight: Fused QKV [qkv_size, hidden_size] (alternative)
             bias_buffer: Optional bias [qkv_size]
         """
-        self._weight_buffer = weight_buffer
+        if qkv_weight is not None:
+            # Use fused weights
+            self._weight_buffer = qkv_weight
+            self._q_weight = None
+            self._k_weight = None
+            self._v_weight = None
+            self.config.fused = True
+        else:
+            # Use separate weights
+            self._q_weight = q_weight
+            self._k_weight = k_weight
+            self._v_weight = v_weight
+            self._weight_buffer = None
+            self.config.fused = False
         self._bias_buffer = bias_buffer
 
     def encode(
         self,
         step_ctx: Any,  # EngineStepContext
         hidden_states: Union[EngineTensor, Any],  # [num_tokens, hidden_size]
-        output_buffer: Any,  # MTLBuffer for QKV output
+        qkv_output: Any,  # MTLBuffer for QKV output
         num_tokens: int,
     ) -> Tuple[Any, Any, Any]:
         """Encode QKV projection to command buffer.
 
-        Computes: QKV = hidden_states @ W_qkv
+        Computes: QKV = hidden_states @ W_qkv (or separate Q, K, V)
 
         Returns views (byte offsets) into output_buffer for Q, K, V.
 
         Args:
             step_ctx: EngineStepContext with encoder
             hidden_states: Input [num_tokens, hidden_size]
-            output_buffer: Output buffer for QKV [num_tokens, qkv_size]
+            qkv_output: Output buffer for QKV [num_tokens, qkv_size]
             num_tokens: Number of tokens
 
         Returns:
             Tuple of (Q_info, K_info, V_info) with buffer offsets
         """
-        if self._weight_buffer is None:
-            raise RuntimeError("Weights not set - call set_weights() first")
-
         if not step_ctx.is_encoding:
             raise RuntimeError("encode() called outside ENCODE phase")
 
-        # Encode GEMM: hidden @ W_qkv -> output
-        # Shape: [num_tokens, hidden_size] @ [hidden_size, qkv_size] -> [num_tokens, qkv_size]
-        self._gemm.encode(
-            step_ctx=step_ctx,
-            A=hidden_states,
-            B=self._weight_buffer,
-            C=output_buffer,
-            M=num_tokens,
-            K=self.config.hidden_size,
-            N=self.config.qkv_size,
-        )
+        element_size = 2  # float16
+
+        if self.config.fused:
+            # Fused QKV projection
+            if self._weight_buffer is None:
+                raise RuntimeError("Fused weights not set - call set_weights(qkv_weight=...) first")
+
+            # Encode GEMM: hidden @ W_qkv^T -> output
+            # Shape: [num_tokens, hidden_size] @ [hidden_size, qkv_size] -> [num_tokens, qkv_size]
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=self._weight_buffer,
+                C=qkv_output,
+                M=num_tokens,
+                K=self.config.hidden_size,
+                N=self.config.qkv_size,
+                transpose_B=True,  # Weight is [qkv_size, hidden_size]
+            )
+        else:
+            # Separate Q, K, V projections
+            if self._q_weight is None or self._k_weight is None or self._v_weight is None:
+                raise RuntimeError("Separate weights not set - call set_weights(q_weight=..., k_weight=..., v_weight=...)")
+
+            # Q projection: [num_tokens, hidden] @ [hidden, q_size] -> [num_tokens, q_size]
+            # Q output starts at offset 0
+            q_tensor = EngineTensor(
+                buffer=qkv_output,
+                shape=(num_tokens, self.config.q_size),
+                dtype=EngineDType.FLOAT16,
+                offset=0,
+            )
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=self._q_weight,
+                C=q_tensor,
+                M=num_tokens,
+                K=self.config.hidden_size,
+                N=self.config.q_size,
+                transpose_B=True,  # Weight is [q_size, hidden_size]
+            )
+
+            # K projection at offset after Q
+            k_offset_bytes = num_tokens * self.config.q_size * element_size
+            k_tensor = EngineTensor(
+                buffer=qkv_output,
+                shape=(num_tokens, self.config.k_size),
+                dtype=EngineDType.FLOAT16,
+                offset=k_offset_bytes,
+            )
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=self._k_weight,
+                C=k_tensor,
+                M=num_tokens,
+                K=self.config.hidden_size,
+                N=self.config.k_size,
+                transpose_B=True,
+            )
+
+            # V projection at offset after Q and K
+            v_offset_bytes = num_tokens * (self.config.q_size + self.config.k_size) * element_size
+            v_tensor = EngineTensor(
+                buffer=qkv_output,
+                shape=(num_tokens, self.config.v_size),
+                dtype=EngineDType.FLOAT16,
+                offset=v_offset_bytes,
+            )
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=self._v_weight,
+                C=v_tensor,
+                M=num_tokens,
+                K=self.config.hidden_size,
+                N=self.config.v_size,
+                transpose_B=True,
+            )
 
         # If we have bias, need to add it
         if self._bias_buffer is not None:

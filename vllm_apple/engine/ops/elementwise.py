@@ -47,6 +47,15 @@ ELEMENTWISE_KERNEL_SOURCE = """
 #include <metal_stdlib>
 using namespace metal;
 
+// Copy kernel: output = input
+kernel void copy_kernel(
+    device const half* input [[buffer(0)]],
+    device half* output [[buffer(1)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    output[idx] = input[idx];
+}
+
 // Residual add: output = x + residual
 kernel void residual_add_kernel(
     device const half* x [[buffer(0)]],
@@ -313,6 +322,37 @@ class EngineElementwiseOps:
         encoder.setBuffer_offset_atIndex_(res_buf, res_off, 1)
 
         self._dispatch_simple(encoder, "residual_add_inplace_kernel", num_elements)
+
+    def encode_copy(
+        self,
+        step_ctx: Any,
+        input_buffer: Union[EngineTensor, Any],
+        output: Union[EngineTensor, Any],
+        num_elements: int,
+    ) -> None:
+        """Encode copy operation: output = input.
+
+        Args:
+            step_ctx: EngineStepContext
+            input_buffer: Source tensor
+            output: Destination tensor
+            num_elements: Number of elements to copy
+        """
+        if not step_ctx.is_encoding:
+            raise RuntimeError("encode() called outside ENCODE phase")
+
+        encoder = step_ctx.get_compute_encoder()
+
+        in_buf = input_buffer.buffer if isinstance(input_buffer, EngineTensor) else input_buffer
+        out_buf = output.buffer if isinstance(output, EngineTensor) else output
+
+        in_off = input_buffer.offset if isinstance(input_buffer, EngineTensor) else 0
+        out_off = output.offset if isinstance(output, EngineTensor) else 0
+
+        encoder.setBuffer_offset_atIndex_(in_buf, in_off, 0)
+        encoder.setBuffer_offset_atIndex_(out_buf, out_off, 1)
+
+        self._dispatch_simple(encoder, "copy_kernel", num_elements)
 
     def encode_silu(
         self,
