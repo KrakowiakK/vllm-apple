@@ -185,6 +185,17 @@ class AppleModelRunner:
             self.vocab_size,
         )
 
+    @property
+    def _input_device(self) -> torch.device:
+        """Device for input tensor preparation.
+
+        Returns CPU for engine mode (CPU-first at boundary per METAL_PLAN),
+        MPS for PyTorch path. This avoids MPS→CPU transfers in engine mode.
+        """
+        if self._use_engine_mode and self._engine_runner is not None:
+            return torch.device("cpu")
+        return self.device
+
     def load_model(self) -> None:
         """Load the model onto MPS device.
 
@@ -477,8 +488,8 @@ class AppleModelRunner:
             except Exception as e:
                 logger.warning("Profile run failed (expected for some models): %s", e)
 
-        # Synchronize MPS
-        if hasattr(torch.mps, "synchronize"):
+        # Synchronize MPS (only for PyTorch path, engine mode handles its own sync)
+        if not self._use_engine_mode and hasattr(torch.mps, "synchronize"):
             torch.mps.synchronize()
 
         logger.info("Profile pass complete")
@@ -562,7 +573,9 @@ class AppleModelRunner:
         forward_output, is_logits = self._execute_forward(model_input, scheduler_output)
 
         if self._timing_enabled:
-            if hasattr(torch.mps, 'synchronize'):
+            # In engine mode, engine handles its own synchronization via waitUntilCompleted
+            # Only synchronize MPS for PyTorch path timing accuracy
+            if not self._use_engine_mode and hasattr(torch.mps, 'synchronize'):
                 torch.mps.synchronize()
             t3 = time.time()
 
@@ -789,19 +802,22 @@ class AppleModelRunner:
             seq_lens.append(len(new_token_ids))
 
         # Convert to tensors
+        # Use _input_device: CPU for engine mode (CPU-first), MPS for PyTorch path
+        input_device = self._input_device
         if input_ids_list:
             input_ids = torch.tensor(
-                input_ids_list, dtype=torch.long, device=self.device
+                input_ids_list, dtype=torch.long, device=input_device
             )
             positions = torch.tensor(
-                positions_list, dtype=torch.long, device=self.device
+                positions_list, dtype=torch.long, device=input_device
             )
         else:
-            input_ids = torch.tensor([], dtype=torch.long, device=self.device)
-            positions = torch.tensor([], dtype=torch.long, device=self.device)
+            input_ids = torch.tensor([], dtype=torch.long, device=input_device)
+            positions = torch.tensor([], dtype=torch.long, device=input_device)
 
         # Build attention metadata
-        attn_metadata = self._build_attn_metadata(req_ids, seq_lens, positions)
+        # Pass positions_list (Python list) to avoid MPS→CPU sync from .tolist()
+        attn_metadata = self._build_attn_metadata(req_ids, seq_lens, positions_list)
 
         # Build sampling metadata
         sampling_metadata = self._build_sampling_metadata(req_ids, seq_lens)
@@ -821,7 +837,7 @@ class AppleModelRunner:
         self,
         req_ids: list[str],
         seq_lens: list[int],
-        positions: torch.Tensor,
+        positions_list: list[int],
     ) -> Any:
         """Build attention metadata for the forward pass.
 
@@ -834,7 +850,7 @@ class AppleModelRunner:
         Args:
             req_ids: Request IDs
             seq_lens: Number of NEW tokens for each request (query length)
-            positions: Position tensor (contains actual positions in sequence)
+            positions_list: Position list (Python list to avoid MPS sync)
 
         Returns:
             AppleAttentionMetadata
@@ -852,9 +868,12 @@ class AppleModelRunner:
         is_prefill = any(s > 1 for s in seq_lens)
         num_decode_tokens = sum(1 for s in seq_lens if s == 1) if not is_prefill else 0
 
+        # Use _input_device: CPU for engine mode (CPU-first), MPS for PyTorch path
+        input_device = self._input_device
+
         # Build query start locations (cumulative sum of query lengths with leading 0)
-        query_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
-        query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=self.device)
+        query_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=input_device)
+        query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=input_device)
         query_start_loc[1:] = torch.cumsum(query_lens_tensor, dim=0)
 
         # Build FULL sequence lengths (computed_tokens + new_tokens)
@@ -869,7 +888,7 @@ class AppleModelRunner:
             else:
                 full_seq_lens.append(seq_lens[req_idx])
 
-        seq_lens_tensor = torch.tensor(full_seq_lens, dtype=torch.int32, device=self.device)
+        seq_lens_tensor = torch.tensor(full_seq_lens, dtype=torch.int32, device=input_device)
 
         # Build slot mapping for KV cache using actual positions
         # slot_mapping tells where to store each token's KV in the cache
@@ -878,11 +897,10 @@ class AppleModelRunner:
         # For decode (most common case): single token per request
         if num_tokens == num_reqs and num_reqs > 0:
             # Fast path: all requests have exactly 1 token (decode phase)
-            # Compute slot mapping directly on GPU
-            positions_cpu = positions.tolist()  # One transfer instead of many .item()
+            # Use positions_list directly (Python list) - no MPS sync needed
             slot_mapping_list = []
             for req_idx, req_id in enumerate(req_ids):
-                token_pos = positions_cpu[req_idx]
+                token_pos = positions_list[req_idx]
                 if req_id in self.requests:
                     req_state = self.requests[req_id]
                     block_ids = req_state.block_ids[0] if req_state.block_ids else []
@@ -895,10 +913,10 @@ class AppleModelRunner:
                 else:
                     slot = token_pos
                 slot_mapping_list.append(slot)
-            slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.long, device=self.device)
+            slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.long, device=input_device)
         else:
             # General path: prefill or mixed batch
-            positions_cpu = positions.tolist()  # One transfer
+            # Use positions_list directly (Python list) - no MPS sync needed
             slot_mapping_list = []
             pos_idx = 0
             for req_idx, req_id in enumerate(req_ids):
@@ -907,7 +925,7 @@ class AppleModelRunner:
                     req_state = self.requests[req_id]
                     block_ids = req_state.block_ids[0] if req_state.block_ids else []
                     for token_idx in range(num_new_tokens):
-                        token_pos = positions_cpu[pos_idx + token_idx]
+                        token_pos = positions_list[pos_idx + token_idx]
                         block_idx = token_pos // self.block_size
                         block_offset = token_pos % self.block_size
                         if block_idx < len(block_ids):
@@ -917,9 +935,9 @@ class AppleModelRunner:
                         slot_mapping_list.append(slot)
                 else:
                     for token_idx in range(num_new_tokens):
-                        slot_mapping_list.append(positions_cpu[pos_idx + token_idx])
+                        slot_mapping_list.append(positions_list[pos_idx + token_idx])
                 pos_idx += num_new_tokens
-            slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.long, device=self.device)
+            slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.long, device=input_device)
 
         # Build block tables for paged attention
         # Optimized: collect all block IDs first, then create tensor once
@@ -943,11 +961,11 @@ class AppleModelRunner:
                 for j, block_id in enumerate(bt):
                     block_table_data[i][j] = block_id
             block_table = torch.tensor(
-                block_table_data, dtype=torch.int32, device=self.device
+                block_table_data, dtype=torch.int32, device=input_device
             )
         else:
             block_table = torch.zeros(
-                (num_reqs, 1), dtype=torch.int32, device=self.device
+                (num_reqs, 1), dtype=torch.int32, device=input_device
             )
 
         # Calculate max lengths
@@ -1173,11 +1191,18 @@ class AppleModelRunner:
         # - max_seq_len calculation for attention
         # - decode KV-write position (seq_len - 1)
         # - paged attention context length
+        #
+        # NOTE: When _input_device returns CPU (engine mode with runner initialized),
+        # tensors are already on CPU - the .to() calls are no-ops. This is the
+        # "CPU-first at boundary" pattern from METAL_PLAN.
+        def ensure_cpu(t: torch.Tensor) -> torch.Tensor:
+            return t if t.device.type == "cpu" else t.cpu()
+
         engine_inputs = EngineInputs(
-            token_ids=model_input.input_ids.cpu(),
-            positions=model_input.positions.cpu(),
-            block_table=attn_metadata.block_table.cpu() if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
-            slot_mapping=attn_metadata.slot_mapping.cpu() if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
+            token_ids=ensure_cpu(model_input.input_ids),
+            positions=ensure_cpu(model_input.positions),
+            block_table=ensure_cpu(attn_metadata.block_table) if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
+            slot_mapping=ensure_cpu(attn_metadata.slot_mapping) if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
             seq_lens=attn_metadata.seq_lens.to(device="cpu", dtype=torch.int32),
         )
 
