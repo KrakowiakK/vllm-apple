@@ -567,17 +567,73 @@ If full-logits readback becomes a bottleneck (large vocab), add **optional** mod
 
 ---
 
+## Progress Tracking (Updated 2025-12-13)
+
+### Phase 0: Baselines, Guardrails, and Metrics
+
+| Item | Status | Notes |
+|------|--------|-------|
+| 0.1 Success Metrics | ⏳ Pending | Documented in plan, benchmarks needed |
+| 0.2 Strict No-PyTorch-MPS Mode | ✅ Done | `VLLM_METAL_STRICT_NO_MPS=1` implemented |
+| 0.3 Profiling Hooks | ✅ Done | `EngineProfiler` implemented |
+
+### Phase 1: Engine MVP
+
+| Item | Status | Notes |
+|------|--------|-------|
+| 1.0 Engine mode flag | ✅ Done | `VLLM_APPLE_USE_ENGINE=1` |
+| 1.1 Engine scaffolding | ✅ Done | `MetalEngineContext`, `EngineStepContext` |
+| 1.2 KV cache single source | ⚠️ Partial | Engine owns MTLBuffer, sync from torch after prefill |
+| 1.3 Paged attention | ⚠️ Decode only | Prefill routes through PyTorch |
+| 1.4 Sync policy enforcement | ✅ Done | Guards implemented |
+
+### Phase 2-4: Model Compute (QKV, GEMM, MLP)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Engine tensor abstraction | ✅ Done | `EngineTensor` wrapper |
+| GEMM strategy | ✅ Done | MPSMatrix implementation |
+| QKV projections | ✅ Done | In-engine |
+| RMSNorm | ✅ Done | Custom kernel |
+| MLP | ✅ Done | Gated SiLU |
+
+### Phase 5: Engine-Only Hot Path
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Step-level chaining | ✅ Done | Single command buffer per step |
+| vLLM integration | ⚠️ Partial | Decode via engine, prefill via PyTorch |
+| E2E validation | ⏳ Pending | Need TinyLlama/Qwen2 tests |
+
+### Known Issues Fixed (with Regression Tests)
+
+| Issue | Fix | Test |
+|-------|-----|------|
+| Prefill attention dispatch | Engine rejects prefill, routes to PyTorch | `test_step_descriptor_prefill_detection` |
+| GPT-2 architecture unsupported | Architecture validation added | `test_gpt2_architecture_rejected` |
+| Strict mode bypass | `ensure_cpu_tensor()` rejects MPS in engine mode | `test_mps_tensor_rejected_in_engine_mode` |
+| Scratch buffer overflow | Bounds checking added | `test_engine_config_max_batch_size` |
+| KV cache data inconsistency | `sync_from_torch_cache()` after prefill | `test_kv_cache_sync_method_exists` |
+
+### Current Limitations
+
+1. **Prefill via PyTorch**: Engine only supports decode (1 token/seq). Prefill routes through PyTorch with KV sync.
+2. **KV Cache Sync Overhead**: After prefill, KV data is copied from torch to engine MTLBuffer. Will be removed when prefill moves to engine.
+3. **Architecture Support**: Only LLaMA/Qwen2/Mistral. GPT-2 and similar are rejected.
+
+---
+
 ## Deliverable Checklist (v2.0)
 
-- [ ] Responsibilities split is explicit (vLLM orchestrator vs engine)
-- [ ] Engine mode flag exists (`VLLM_APPLE_USE_ENGINE=1`, default off)
-- [ ] Strict mode (`VLLM_METAL_STRICT_NO_MPS=1`) enforced by tests
-- [ ] Engine API includes step/batch descriptor (`step_kind`, `num_scheduled_tokens`, `num_seqs_active`)
-- [ ] KV cache single source of truth (engine-owned `MTLBuffer`, no full torch duplication)
-- [ ] Step-boundary-only synchronization enforced (no per-layer/per-op waits)
+- [x] Responsibilities split is explicit (vLLM orchestrator vs engine)
+- [x] Engine mode flag exists (`VLLM_APPLE_USE_ENGINE=1`, default off)
+- [x] Strict mode (`VLLM_METAL_STRICT_NO_MPS=1`) enforced by tests
+- [x] Engine API includes step/batch descriptor (`step_kind`, `num_scheduled_tokens`, `num_seqs_active`)
+- [~] KV cache single source of truth (engine-owned `MTLBuffer`, sync from torch after prefill)
+- [x] Step-boundary-only synchronization enforced (no per-layer/per-op waits)
 - [ ] Paged attention + KV-write executed by engine and benchmarked (batch 1/4/8/16)
-- [ ] QKV / O-proj moved into engine (GEMM on `MTLBuffer`)
-- [ ] RMSNorm + MLP moved into engine (full transformer block in-engine)
+- [x] QKV / O-proj moved into engine (GEMM on `MTLBuffer`)
+- [x] RMSNorm + MLP moved into engine (full transformer block in-engine)
 - [ ] Engine-backed vLLM runner produces logits end-to-end for supported model(s)
 - [ ] Continuous batching validated under load (no batch-8 cliff)
 - [ ] Packaging + wheel asset tests updated for any new kernels/binaries

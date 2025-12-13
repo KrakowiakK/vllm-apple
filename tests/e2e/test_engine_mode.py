@@ -7,8 +7,12 @@ This validates the full engine execution path including:
 - Engine runner initialization
 - Weight loading to MTLBuffer
 - KV cache in engine mode
-- Forward pass execution
+- Forward pass execution (decode only - prefill uses PyTorch)
 - Step-boundary-only synchronization
+
+IMPORTANT: Engine mode only supports LLaMA-family architectures (LLaMA, Qwen2, Mistral)
+that use RMSNorm, RoPE, and gated SiLU MLP. Models like GPT-2 are NOT supported
+and will fall back to PyTorch execution.
 
 Run with:
     VLLM_APPLE_USE_ENGINE=1 pytest tests/e2e/test_engine_mode.py -v
@@ -102,20 +106,27 @@ class TestEngineMode:
         not torch.backends.mps.is_available(),
         reason="MPS not available"
     )
-    def test_engine_with_gpt2(self):
-        """Test engine mode with GPT-2 model."""
+    def test_engine_with_tinyllama(self):
+        """Test engine mode with TinyLlama model.
+
+        TinyLlama uses the LLaMA architecture which is supported by the engine:
+        - RMSNorm (not LayerNorm)
+        - RoPE positional embeddings (not absolute)
+        - Gated SiLU MLP (not standard GELU)
+        """
         from vllm import LLM, SamplingParams
 
         print("\n" + "="*60)
-        print("  Engine Mode E2E Test: GPT-2")
+        print("  Engine Mode E2E Test: TinyLlama")
         print("="*60)
         print(f"Engine mode: {is_engine_mode_enabled()}")
         print(f"Strict mode: {is_strict_mode_enabled()}")
 
         # Create LLM with engine mode
+        # TinyLlama-1.1B is a small LLaMA-architecture model
         try:
             llm = LLM(
-                model="gpt2",
+                model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                 dtype="float16",
                 max_model_len=256,
                 trust_remote_code=False,
@@ -154,16 +165,16 @@ class TestEngineMode:
         reason="MPS not available"
     )
     def test_engine_decode_throughput(self):
-        """Test decode throughput in engine mode."""
+        """Test decode throughput in engine mode with TinyLlama."""
         from vllm import LLM, SamplingParams
 
         print("\n" + "="*60)
-        print("  Engine Mode Decode Throughput Test")
+        print("  Engine Mode Decode Throughput Test: TinyLlama")
         print("="*60)
 
-        # Create LLM
+        # Create LLM with TinyLlama (LLaMA architecture)
         llm = LLM(
-            model="gpt2",
+            model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             dtype="float16",
             max_model_len=256,
             trust_remote_code=False,
@@ -198,6 +209,76 @@ class TestEngineMode:
 
         # Verify throughput increases with batch size (roughly)
         assert results[2] >= results[1] * 0.8, "Batch 2 should be at least 80% of batch 1"
+
+
+class TestEngineArchitectureValidation:
+    """Tests for engine mode architecture validation."""
+
+    @pytest.mark.skipif(
+        not torch.backends.mps.is_available(),
+        reason="MPS not available"
+    )
+    def test_unsupported_architecture_rejected(self):
+        """Verify that unsupported architectures are rejected in engine mode.
+
+        GPT-2 uses LayerNorm + absolute position embeddings + GELU MLP,
+        which is incompatible with EngineRunner (requires RMSNorm + RoPE + SiLU).
+        """
+        from vllm_apple.engine import (
+            ModelDescriptor,
+            SUPPORTED_ENGINE_ARCHITECTURES,
+        )
+
+        print("\n" + "="*60)
+        print("  Architecture Validation Test")
+        print("="*60)
+        print(f"Supported architectures: {sorted(SUPPORTED_ENGINE_ARCHITECTURES)}")
+
+        # Verify GPT-2 is rejected
+        with pytest.raises(ValueError) as exc_info:
+            ModelDescriptor(
+                num_layers=12,
+                hidden_size=768,
+                num_attention_heads=12,
+                num_kv_heads=12,
+                head_size=64,
+                intermediate_size=3072,
+                vocab_size=50257,
+                architecture="gpt2",
+            )
+
+        error_msg = str(exc_info.value)
+        assert "gpt2" in error_msg.lower()
+        assert "not supported" in error_msg.lower()
+        print(f"GPT-2 correctly rejected: {error_msg[:100]}...")
+
+        # Verify LLaMA is accepted
+        desc = ModelDescriptor(
+            num_layers=12,
+            hidden_size=768,
+            num_attention_heads=12,
+            num_kv_heads=12,
+            head_size=64,
+            intermediate_size=3072,
+            vocab_size=32000,
+            architecture="llama",
+        )
+        assert desc.architecture == "llama"
+        print("LLaMA architecture accepted")
+
+        # Verify Qwen2 is accepted
+        desc = ModelDescriptor(
+            num_layers=12,
+            hidden_size=768,
+            num_attention_heads=12,
+            num_kv_heads=12,
+            head_size=64,
+            intermediate_size=3072,
+            vocab_size=32000,
+            architecture="qwen2",
+        )
+        assert desc.architecture == "qwen2"
+        print("Qwen2 architecture accepted")
 
 
 class TestEngineStrictMode:

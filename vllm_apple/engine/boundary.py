@@ -281,26 +281,36 @@ def ensure_cpu_tensor(
     name: str = "tensor",
     copy: bool = False,
     strict_mode: Optional[bool] = None,
+    allow_mps_conversion: bool = False,
 ) -> Optional[torch.Tensor]:
     """Ensure tensor is on CPU.
 
     This is a utility for preparing inputs at the engine boundary.
+
+    IMPORTANT: When engine mode is enabled, MPS tensors are ALWAYS rejected
+    (no silent conversion) to prevent implicit synchronization. The calling
+    code must ensure tensors are already on CPU before reaching the boundary.
 
     Args:
         tensor: Input tensor (may be None, CPU, or MPS)
         name: Name for logging
         copy: If True, always make a copy even if already on CPU
         strict_mode: If True, raise on MPS tensor instead of converting.
-                     If None, uses is_strict_mode() to determine.
+                     If None, uses is_strict_mode() OR is_engine_mode_enabled().
+        allow_mps_conversion: DANGEROUS - only set True for non-engine paths
+                              that explicitly need MPS→CPU conversion.
+                              This bypasses the engine mode safety check.
 
     Returns:
         CPU tensor, or None if input was None
 
     Raises:
-        RuntimeError: If strict_mode and tensor is on MPS device.
+        RuntimeError: If tensor is on MPS device and conversion is not allowed.
                       MPS tensors should be pre-converted BEFORE calling
                       engine boundary functions.
     """
+    from .config import is_engine_mode_enabled
+
     if tensor is None:
         return None
 
@@ -312,24 +322,32 @@ def ensure_cpu_tensor(
             return tensor.clone()
         return tensor
 
-    # Check strict mode
+    # Determine if we should reject MPS tensors
+    # Engine mode: ALWAYS reject (causes implicit sync, violates boundary invariant)
+    # Strict mode: Reject (for debugging/validation)
+    # allow_mps_conversion: Override for legacy non-engine paths
     if strict_mode is None:
-        strict_mode = is_strict_mode()
+        # In engine mode, we're strict by default to prevent hidden syncs
+        strict_mode = is_strict_mode() or is_engine_mode_enabled()
 
-    if strict_mode:
-        # In strict mode: fail-fast, don't silently convert
+    # allow_mps_conversion explicitly overrides strict mode (use with caution)
+    if strict_mode and not allow_mps_conversion:
+        # Fail-fast: don't silently convert MPS→CPU
+        mode_reason = "engine mode" if is_engine_mode_enabled() else "strict mode"
         raise RuntimeError(
-            f"MPS tensor '{name}' passed to engine boundary in strict mode. "
+            f"MPS tensor '{name}' passed to engine boundary in {mode_reason}. "
             f"Device: {tensor.device}. "
-            f"MPS→CPU conversion is not allowed in strict mode. "
+            f"MPS→CPU conversion is not allowed because it causes implicit "
+            f"synchronization, violating the step-boundary-only sync invariant. "
             f"Tensors must be on CPU BEFORE reaching engine boundary. "
-            f"Convert tensors in vLLM code, not in engine code."
+            f"Fix the calling code to use CPU tensors."
         )
 
-    # Non-strict mode: convert with warning
+    # Non-strict mode with explicit conversion allowed: convert with warning
     logger.warning(
         f"Converting '{name}' from {tensor.device} to CPU at engine boundary. "
-        f"This should be done in vLLM code, not here."
+        f"This causes implicit synchronization and should be avoided in engine mode. "
+        f"Consider fixing the calling code to provide CPU tensors."
     )
     return tensor.cpu()
 

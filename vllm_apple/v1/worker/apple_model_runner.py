@@ -138,6 +138,7 @@ class AppleModelRunner:
         # Engine mode (v2.0 Metal engine)
         self._use_engine_mode = is_engine_mode_enabled()
         self._engine_runner = None  # Initialized in load_model if engine mode
+        self._engine_kv_cache = None  # Engine KV cache for prefill→decode sync
         if self._use_engine_mode:
             logger.info("Engine mode enabled (VLLM_APPLE_USE_ENGINE=1)")
 
@@ -185,15 +186,58 @@ class AppleModelRunner:
             self.vocab_size,
         )
 
+    def _get_input_device(self, is_decode_only: bool) -> torch.device:
+        """Get device for input tensor preparation based on step type.
+
+        This implements step-aware device selection per METAL_PLAN.md:
+        - Prefill steps: MPS (PyTorch model needs MPS inputs)
+        - Decode-only steps in engine mode: CPU (engine needs CPU inputs)
+        - Decode steps without engine mode: MPS (PyTorch path)
+
+        By preparing inputs on the correct device from the start, we avoid
+        costly MPS→CPU conversions at the engine boundary during decode.
+
+        Args:
+            is_decode_only: True if this step has no prefill requests
+
+        Returns:
+            Device for input tensor preparation
+        """
+        if self._use_engine_mode and self._engine_runner is not None and is_decode_only:
+            # Engine decode: prepare inputs on CPU directly
+            # This avoids MPS→CPU conversion overhead at boundary
+            return torch.device("cpu")
+        else:
+            # Prefill or non-engine path: PyTorch model needs MPS inputs
+            return self.device
+
+    def _is_decode_only_step(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Check if this step contains only decode requests (no prefill).
+
+        A decode-only step has:
+        - No new requests (scheduled_new_reqs is empty)
+        - All requests are continuing/cached (have prior context)
+
+        Args:
+            scheduler_output: Scheduler output to check
+
+        Returns:
+            True if all requests are decode, False if any prefill
+        """
+        # If there are any new requests, this is not decode-only
+        if scheduler_output.scheduled_new_reqs:
+            return False
+        # No new requests = all decode
+        return True
+
     @property
     def _input_device(self) -> torch.device:
-        """Device for input tensor preparation.
+        """Legacy property for backwards compatibility.
 
-        Returns CPU for engine mode (CPU-first at boundary per METAL_PLAN),
-        MPS for PyTorch path. This avoids MPS→CPU transfers in engine mode.
+        DEPRECATED: Use _get_input_device(is_decode_only) instead.
+        This property always returns MPS for safety (assumes prefill).
         """
-        if self._use_engine_mode and self._engine_runner is not None:
-            return torch.device("cpu")
+        # Default to MPS (safe for prefill)
         return self.device
 
     def load_model(self) -> None:
@@ -251,7 +295,35 @@ class AppleModelRunner:
 
         # Initialize engine runner if engine mode is enabled
         if self._use_engine_mode:
+            self._try_init_engine_runner()
+
+    def _try_init_engine_runner(self) -> None:
+        """Try to initialize engine runner with graceful fallback.
+
+        If engine initialization fails:
+        - In strict mode: re-raise the error (no silent fallback)
+        - In non-strict mode: log warning and disable engine mode
+        """
+        try:
             self._init_engine_runner()
+        except Exception as e:
+            if is_strict_mode():
+                # Strict mode: fail fast, no silent fallback
+                logger.error(
+                    "Engine initialization failed in strict mode: %s\n"
+                    "Strict mode (VLLM_METAL_STRICT_NO_MPS=1) does not allow "
+                    "silent fallback to PyTorch/MPS.", e
+                )
+                raise
+            else:
+                # Non-strict mode: graceful fallback to PyTorch
+                logger.warning(
+                    "Engine initialization failed, falling back to PyTorch/MPS: %s\n"
+                    "To require engine mode, set VLLM_METAL_STRICT_NO_MPS=1", e
+                )
+                self._use_engine_mode = False
+                self._engine_runner = None
+                self._engine_kv_cache = None
 
     def _init_engine_runner(self) -> None:
         """Initialize the engine runner for v2.0 Metal engine mode.
@@ -290,6 +362,10 @@ class AppleModelRunner:
             if intermediate_size is None:
                 intermediate_size = 4 * hidden_size
 
+        # Detect architecture from hf_config for engine validation
+        architecture = ModelDescriptor._detect_architecture(hf_config)
+        logger.info(f"Detected model architecture: {architecture}")
+
         model_desc = ModelDescriptor(
             hidden_size=hidden_size,
             num_attention_heads=self.model_config.get_num_attention_heads(
@@ -302,6 +378,7 @@ class AppleModelRunner:
             vocab_size=self.vocab_size,
             max_position_embeddings=self.max_model_len,
             rope_theta=getattr(hf_config, 'rope_theta', 10000.0),
+            architecture=architecture,  # Will raise ValueError if unsupported
         )
 
         # Engine KV cache will be initialized in initialize_kv_cache
@@ -515,7 +592,8 @@ class AppleModelRunner:
 
         # Create engine KV cache
         # The engine will use MTLBuffer for KV storage
-        engine_kv_cache = EngineKVCache(
+        # Store as instance variable for KV sync after prefill
+        self._engine_kv_cache = EngineKVCache(
             engine_context=self._engine_context,
             descriptor=kv_desc,
         )
@@ -543,7 +621,7 @@ class AppleModelRunner:
             context=self._engine_context,
             model_desc=self._engine_model_desc,
             weights=weights,
-            kv_cache=engine_kv_cache,
+            kv_cache=self._engine_kv_cache,
         )
 
         logger.info(
@@ -825,12 +903,20 @@ class AppleModelRunner:
         - attn_metadata: Attention metadata (sequence lengths, masks, etc.)
         - sampling_metadata: Sampling parameters for each request
 
+        STEP-AWARE DEVICE SELECTION:
+        - Prefill steps (has scheduled_new_reqs): inputs on MPS for PyTorch
+        - Decode-only steps with engine mode: inputs on CPU for engine
+        This avoids MPS→CPU conversion overhead at the engine boundary.
+
         Args:
             scheduler_output: Output from scheduler
 
         Returns:
             AppleModelInput with all necessary tensors
         """
+        # Detect step type early for device selection
+        is_decode_only = self._is_decode_only_step(scheduler_output)
+
         input_ids_list = []
         positions_list = []
         req_ids = []
@@ -899,9 +985,10 @@ class AppleModelRunner:
             req_ids.append(req_id)
             seq_lens.append(len(new_token_ids))
 
-        # Convert to tensors
-        # Use _input_device: CPU for engine mode (CPU-first), MPS for PyTorch path
-        input_device = self._input_device
+        # Convert to tensors using step-aware device selection
+        # - Decode-only + engine mode: CPU (engine expects CPU inputs)
+        # - Prefill or non-engine: MPS (PyTorch model expects MPS inputs)
+        input_device = self._get_input_device(is_decode_only)
         if input_ids_list:
             input_ids = torch.tensor(
                 input_ids_list, dtype=torch.long, device=input_device
@@ -915,7 +1002,8 @@ class AppleModelRunner:
 
         # Build attention metadata
         # Pass positions_list (Python list) to avoid MPS→CPU sync from .tolist()
-        attn_metadata = self._build_attn_metadata(req_ids, seq_lens, positions_list)
+        # Pass is_decode_only for consistent device selection
+        attn_metadata = self._build_attn_metadata(req_ids, seq_lens, positions_list, is_decode_only)
 
         # Build sampling metadata
         sampling_metadata = self._build_sampling_metadata(req_ids, seq_lens)
@@ -936,6 +1024,7 @@ class AppleModelRunner:
         req_ids: list[str],
         seq_lens: list[int],
         positions_list: list[int],
+        is_decode_only: bool = False,
     ) -> Any:
         """Build attention metadata for the forward pass.
 
@@ -949,6 +1038,7 @@ class AppleModelRunner:
             req_ids: Request IDs
             seq_lens: Number of NEW tokens for each request (query length)
             positions_list: Position list (Python list to avoid MPS sync)
+            is_decode_only: True if this is a decode-only step (no prefill)
 
         Returns:
             AppleAttentionMetadata
@@ -966,8 +1056,10 @@ class AppleModelRunner:
         is_prefill = any(s > 1 for s in seq_lens)
         num_decode_tokens = sum(1 for s in seq_lens if s == 1) if not is_prefill else 0
 
-        # Use _input_device: CPU for engine mode (CPU-first), MPS for PyTorch path
-        input_device = self._input_device
+        # Use step-aware device selection for consistent tensor placement
+        # - Decode-only + engine mode: CPU (engine expects CPU inputs)
+        # - Prefill or non-engine: MPS (PyTorch model expects MPS inputs)
+        input_device = self._get_input_device(is_decode_only)
 
         # Build query start locations (cumulative sum of query lengths with leading 0)
         query_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=input_device)
@@ -1204,22 +1296,38 @@ class AppleModelRunner:
             - Engine path: (logits [num_reqs, vocab_size], True)
         """
         # Engine mode path (v2.0 Metal engine)
-        if self._use_engine_mode:
-            if self._engine_runner is not None:
-                return self._execute_forward_engine(model_input), True
-            else:
-                # Engine mode enabled but runner not initialized
-                if is_strict_mode():
-                    raise RuntimeError(
-                        "Engine mode enabled (VLLM_APPLE_USE_ENGINE=1) but engine runner "
-                        "not initialized. In strict mode (VLLM_METAL_STRICT_NO_MPS=1), "
-                        "silent fallback to PyTorch/MPS is not allowed. "
-                        "Ensure model weights are loaded to engine before inference."
-                    )
-                logger.warning(
-                    "Engine mode enabled but runner not initialized - "
-                    "falling back to PyTorch/MPS path"
+        if self._use_engine_mode and self._engine_runner is not None:
+            # Check if this is a prefill step - engine only supports decode
+            # Detect prefill from attn_metadata: num_decode_tokens < num_actual_tokens
+            attn_metadata = model_input.attn_metadata
+            is_prefill = attn_metadata.num_decode_tokens < attn_metadata.num_actual_tokens
+
+            if is_prefill:
+                # Route prefill through PyTorch path
+                # Engine attention kernel only supports decode (1 token per seq)
+                logger.debug(
+                    f"Prefill step (num_tokens={model_input.num_scheduled_tokens}, "
+                    f"num_decode={attn_metadata.num_decode_tokens}) - using PyTorch path"
                 )
+                # Execute prefill via PyTorch, then sync KV cache to engine
+                result = self._execute_prefill_and_sync_kv(model_input)
+                return result, False  # Returns hidden states, not logits
+            else:
+                # Decode step - use engine
+                return self._execute_forward_engine(model_input), True
+        elif self._use_engine_mode:
+            # Engine mode enabled but runner not initialized
+            if is_strict_mode():
+                raise RuntimeError(
+                    "Engine mode enabled (VLLM_APPLE_USE_ENGINE=1) but engine runner "
+                    "not initialized. In strict mode (VLLM_METAL_STRICT_NO_MPS=1), "
+                    "silent fallback to PyTorch/MPS is not allowed. "
+                    "Ensure model weights are loaded to engine before inference."
+                )
+            logger.warning(
+                "Engine mode enabled but runner not initialized - "
+                "falling back to PyTorch/MPS path"
+            )
 
         # Standard PyTorch path
         # Set forward context - attention layers access KV caches through this
@@ -1235,6 +1343,65 @@ class AppleModelRunner:
             )
 
         return hidden_states, False
+
+    def _execute_prefill_and_sync_kv(
+        self,
+        model_input: AppleModelInput,
+    ) -> torch.Tensor:
+        """Execute prefill via PyTorch and sync KV cache to engine.
+
+        This method:
+        1. Runs prefill through PyTorch path (attention writes to torch KV cache)
+        2. Syncs the KV data from torch cache to engine MTLBuffers
+        3. Returns hidden states for LM head computation
+
+        This ensures that after prefill, the engine's KV cache contains the
+        correct data for subsequent decode steps.
+
+        IMPORTANT: This sync is a temporary solution until prefill is moved
+        to the engine. It adds overhead but ensures correctness.
+
+        Args:
+            model_input: Prepared model input
+
+        Returns:
+            Hidden states tensor [num_tokens, hidden_size]
+        """
+        # Execute prefill via PyTorch path
+        with set_forward_context(
+            model_input.attn_metadata,
+            self.vllm_config,
+            num_tokens=model_input.num_scheduled_tokens,
+        ):
+            hidden_states = self.model(
+                input_ids=model_input.input_ids,
+                positions=model_input.positions,
+            )
+
+        # Sync KV cache from torch to engine
+        # This ensures engine's MTLBuffers contain the prefill KV data
+        if hasattr(self, '_engine_kv_cache') and self._engine_kv_cache is not None:
+            attn_metadata = model_input.attn_metadata
+
+            # Get seq_lens from attn_metadata (full sequence lengths)
+            seq_lens = attn_metadata.seq_lens
+
+            # Get block_table
+            block_table = attn_metadata.block_table if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32)
+
+            if block_table.numel() > 0:
+                logger.debug(
+                    f"Syncing KV cache after prefill: "
+                    f"{len(self.kv_caches)} layers, "
+                    f"block_table shape {block_table.shape}"
+                )
+                self._engine_kv_cache.sync_from_torch_cache(
+                    torch_caches=self.kv_caches,
+                    block_table=block_table,
+                    seq_lens=seq_lens,
+                )
+
+        return hidden_states
 
     def _execute_forward_engine(
         self,
@@ -1290,18 +1457,18 @@ class AppleModelRunner:
         # - decode KV-write position (seq_len - 1)
         # - paged attention context length
         #
-        # NOTE: When _input_device returns CPU (engine mode with runner initialized),
-        # tensors are already on CPU - the .to() calls are no-ops. This is the
-        # "CPU-first at boundary" pattern from METAL_PLAN.
-        def ensure_cpu(t: torch.Tensor) -> torch.Tensor:
-            return t if t.device.type == "cpu" else t.cpu()
+        # STEP-AWARE BOUNDARY: For decode-only steps, inputs were prepared on CPU
+        # directly via _get_input_device(is_decode_only=True). This avoids
+        # MPS→CPU sync overhead. The ensure_cpu_tensor call validates the invariant
+        # that engine inputs must be on CPU - no conversion should be needed.
+        from vllm_apple.engine.boundary import ensure_cpu_tensor
 
         engine_inputs = EngineInputs(
-            token_ids=ensure_cpu(model_input.input_ids),
-            positions=ensure_cpu(model_input.positions),
-            block_table=ensure_cpu(attn_metadata.block_table) if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
-            slot_mapping=ensure_cpu(attn_metadata.slot_mapping) if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
-            seq_lens=attn_metadata.seq_lens.to(device="cpu", dtype=torch.int32),
+            token_ids=ensure_cpu_tensor(model_input.input_ids, "token_ids"),
+            positions=ensure_cpu_tensor(model_input.positions, "positions"),
+            block_table=ensure_cpu_tensor(attn_metadata.block_table, "block_table") if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
+            slot_mapping=ensure_cpu_tensor(attn_metadata.slot_mapping, "slot_mapping") if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
+            seq_lens=ensure_cpu_tensor(attn_metadata.seq_lens.to(dtype=torch.int32), "seq_lens"),
         )
 
         # Execute via engine runner

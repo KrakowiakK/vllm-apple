@@ -37,6 +37,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 @dataclass
 class StepDescriptor:
@@ -304,6 +308,15 @@ class KVCacheDescriptor:
         return self.total_cache_bytes / (1024 * 1024)
 
 
+# Architectures supported by EngineRunner
+# These all use RMSNorm, RoPE, and gated SiLU MLP
+SUPPORTED_ENGINE_ARCHITECTURES = frozenset({
+    "llama",
+    "qwen2",
+    "mistral",
+})
+
+
 @dataclass
 class ModelDescriptor:
     """Describes the model configuration for engine execution.
@@ -319,6 +332,7 @@ class ModelDescriptor:
         dtype: Model data type
         rope_theta: RoPE theta parameter
         max_position_embeddings: Maximum sequence length
+        architecture: Model architecture (e.g., "llama", "qwen2", "gpt2")
     """
 
     num_layers: int
@@ -331,6 +345,18 @@ class ModelDescriptor:
     dtype: torch.dtype = torch.float16
     rope_theta: float = 10000.0
     max_position_embeddings: int = 8192
+    architecture: str = "llama"
+
+    def __post_init__(self):
+        """Validate architecture is supported."""
+        if self.architecture.lower() not in SUPPORTED_ENGINE_ARCHITECTURES:
+            raise ValueError(
+                f"Architecture '{self.architecture}' is not supported by EngineRunner. "
+                f"Supported architectures: {sorted(SUPPORTED_ENGINE_ARCHITECTURES)}. "
+                f"EngineRunner requires models with RMSNorm, RoPE, and gated SiLU MLP. "
+                f"Models like GPT-2 (LayerNorm, absolute pos embeddings, GELU MLP) "
+                f"must use the PyTorch execution path."
+            )
 
     @property
     def num_query_groups(self) -> int:
@@ -374,7 +400,13 @@ class ModelDescriptor:
 
         Returns:
             ModelDescriptor
+
+        Raises:
+            ValueError: If architecture is not supported by engine mode
         """
+        # Detect architecture from config
+        arch = cls._detect_architecture(config)
+
         return cls(
             num_layers=getattr(config, "num_hidden_layers", config.num_layers),
             hidden_size=config.hidden_size,
@@ -385,4 +417,75 @@ class ModelDescriptor:
             vocab_size=config.vocab_size,
             rope_theta=getattr(config, "rope_theta", 10000.0),
             max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
+            architecture=arch,
         )
+
+    @staticmethod
+    def _detect_architecture(config: Any) -> str:
+        """Detect model architecture from HuggingFace config.
+
+        IMPORTANT: This detection is CONSERVATIVE. If we can't confidently
+        identify the architecture, we return "unknown" which will trigger
+        validation failure. This is safer than guessing wrong.
+
+        Args:
+            config: HuggingFace model config
+
+        Returns:
+            Architecture string (e.g., "llama", "qwen2", "gpt2", "unknown")
+        """
+        # First, check for explicitly unsupported architectures (MoE, etc.)
+        # Plan says "no MoE" - reject these explicitly
+        if hasattr(config, "num_local_experts") or hasattr(config, "num_experts"):
+            num_experts = getattr(config, "num_local_experts", None) or getattr(config, "num_experts", None)
+            if num_experts is not None and num_experts > 1:
+                logger.warning(
+                    f"MoE model detected (num_experts={num_experts}). "
+                    f"MoE is not supported by engine mode."
+                )
+                return "moe_unsupported"
+
+        # Check model_type attribute first (most reliable)
+        model_type = getattr(config, "model_type", "").lower()
+        if model_type:
+            # Map model types to canonical architecture names
+            # ONLY include explicitly supported architectures
+            arch_mapping = {
+                "llama": "llama",
+                "qwen2": "qwen2",
+                "qwen": "qwen2",  # Qwen1 uses same arch
+                "mistral": "mistral",
+                "gpt2": "gpt2",
+                "gpt_neo": "gpt2",
+                "gpt_neox": "gpt2",
+                "opt": "gpt2",
+            }
+            if model_type in arch_mapping:
+                return arch_mapping[model_type]
+
+        # Check architectures list (second most reliable)
+        architectures = getattr(config, "architectures", [])
+        for arch in architectures:
+            arch_lower = arch.lower()
+            # Check for MoE in architecture name
+            if "moe" in arch_lower or "mixtral" in arch_lower:
+                logger.warning(f"MoE architecture detected: {arch}")
+                return "moe_unsupported"
+            if "llama" in arch_lower:
+                return "llama"
+            if "qwen" in arch_lower:
+                return "qwen2"
+            if "mistral" in arch_lower:
+                return "mistral"
+            if "gpt2" in arch_lower or "gptneo" in arch_lower or "gptneox" in arch_lower:
+                return "gpt2"
+
+        # NO FALLBACK: Do not guess based on rope_theta or other heuristics.
+        # This was a bug - MoE models also have rope_theta.
+        # If we can't identify the architecture, fail safely.
+        logger.warning(
+            f"Could not detect architecture from config. "
+            f"model_type='{model_type}', architectures={architectures}. "
+            f"Returning 'unknown' which will trigger validation failure."
+        )
+        return "unknown"

@@ -315,11 +315,41 @@ class EngineWeightLoader:
 
                 suffix = key[len(prefix):]
 
-                if "q_proj.weight" in suffix:
+                # IMPORTANT: Check fused weights FIRST before individual weights.
+                # vLLM uses fused qkv_proj and gate_up_proj internally.
+                # The substring check "v_proj.weight" in "qkv_proj.weight" returns True,
+                # so we must check for fused weights before individual projections.
+
+                if "qkv_proj.weight" in suffix:
+                    # vLLM fused QKV - store as qkv_proj
+                    layer.qkv_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.qkv_proj")
+                    # Infer num_attention_heads from fused QKV shape
+                    # Shape is [(num_heads + 2*num_kv_heads) * head_size, hidden_size]
+                    # For non-GQA: num_heads = num_kv_heads, so shape[0] = 3 * num_heads * head_size
+                    if weights.hidden_size > 0:
+                        # Assume head_size = 64 or 128, try to infer num_heads
+                        qkv_size = tensor.shape[0]
+                        for head_size in [128, 64, 96, 32]:
+                            if qkv_size % head_size == 0:
+                                total_heads = qkv_size // head_size
+                                # For GQA: total = num_heads + 2*num_kv_heads
+                                # For non-GQA: total = 3*num_heads
+                                # Try assuming non-GQA first
+                                if total_heads % 3 == 0:
+                                    weights.num_attention_heads = total_heads // 3
+                                    weights.num_kv_heads = weights.num_attention_heads
+                                    weights.head_size = head_size
+                                    break
+                elif "q_proj.weight" in suffix:
                     layer.q_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.q_proj")
-                    weights.num_attention_heads = tensor.shape[0] // (weights.hidden_size // tensor.shape[0] if tensor.shape[0] > 0 else 1)
+                    if weights.hidden_size > 0:
+                        weights.head_size = weights.hidden_size // (tensor.shape[0] // weights.hidden_size) if tensor.shape[0] > weights.hidden_size else weights.hidden_size // max(1, tensor.shape[0] // 64)
+                        weights.num_attention_heads = tensor.shape[0] // max(1, weights.head_size) if weights.head_size > 0 else tensor.shape[0] // 64
                 elif "k_proj.weight" in suffix:
                     layer.k_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.k_proj")
+                    # Infer num_kv_heads from k_proj shape
+                    if weights.head_size > 0:
+                        weights.num_kv_heads = tensor.shape[0] // weights.head_size
                 elif "v_proj.weight" in suffix:
                     layer.v_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.v_proj")
                 elif "o_proj.weight" in suffix:
@@ -328,6 +358,11 @@ class EngineWeightLoader:
                     layer.input_layernorm = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.input_ln")
                 elif "post_attention_layernorm.weight" in suffix:
                     layer.post_attention_layernorm = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.post_attn_ln")
+                elif "gate_up_proj.weight" in suffix:
+                    # vLLM fused gate-up projection
+                    layer.gate_up_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.gate_up_proj")
+                    # Shape is [2 * intermediate_size, hidden_size]
+                    weights.intermediate_size = tensor.shape[0] // 2
                 elif "gate_proj.weight" in suffix:
                     layer.gate_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.gate_proj")
                     weights.intermediate_size = tensor.shape[0]
@@ -354,7 +389,22 @@ class EngineWeightLoader:
         return weights
 
     def _load_gpt2_weights(self, state_dict: Dict[str, Any]) -> ModelWeights:
-        """Load weights for GPT-2 architecture."""
+        """Load weights for GPT-2 architecture.
+
+        WARNING: GPT-2 is NOT supported by EngineRunner. This method exists
+        for potential debugging and to document the weight mapping, but
+        EngineRunner will reject GPT-2 models because they use:
+        - LayerNorm (not RMSNorm)
+        - Absolute position embeddings (not RoPE)
+        - Standard GELU MLP (not gated SiLU)
+
+        Use LLaMA, Qwen2, or Mistral models for engine mode.
+        """
+        logger.warning(
+            "Loading GPT-2 weights, but GPT-2 is NOT supported by EngineRunner. "
+            "EngineRunner requires models with RMSNorm, RoPE, and gated SiLU MLP. "
+            "Use LLaMA, Qwen2, or Mistral models instead."
+        )
         weights = ModelWeights()
 
         # Detect number of layers from transformer.h.X pattern

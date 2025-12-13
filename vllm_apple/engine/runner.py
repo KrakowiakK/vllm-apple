@@ -232,18 +232,45 @@ class EngineRunner:
             lw = w.layers[layer_idx]
 
             layer_ops.input_norm.set_weights(lw.input_layernorm)
-            layer_ops.qkv_proj.set_weights(
-                q_weight=lw.q_proj,
-                k_weight=lw.k_proj,
-                v_weight=lw.v_proj,
-            )
+
+            # Handle both fused QKV and separate Q/K/V weights
+            # Models may use either pattern depending on architecture/source
+            if lw.qkv_proj is not None:
+                # Fused QKV weights (single matrix)
+                layer_ops.qkv_proj.set_weights(qkv_weight=lw.qkv_proj)
+            elif lw.q_proj is not None and lw.k_proj is not None and lw.v_proj is not None:
+                # Separate Q, K, V weights
+                layer_ops.qkv_proj.set_weights(
+                    q_weight=lw.q_proj,
+                    k_weight=lw.k_proj,
+                    v_weight=lw.v_proj,
+                )
+            else:
+                # Neither found - this is a weight loading failure
+                raise RuntimeError(
+                    f"Layer {layer_idx}: No QKV weights found. "
+                    f"Expected either qkv_proj (fused) or q_proj/k_proj/v_proj (separate). "
+                    f"Got: qkv_proj={lw.qkv_proj is not None}, "
+                    f"q_proj={lw.q_proj is not None}, k_proj={lw.k_proj is not None}, v_proj={lw.v_proj is not None}"
+                )
+
             layer_ops.o_proj.set_weights(lw.o_proj)
             layer_ops.post_attn_norm.set_weights(lw.post_attention_layernorm)
-            layer_ops.mlp.set_weights(
-                gate_proj=lw.gate_proj,
-                up_proj=lw.up_proj,
-                down_proj=lw.down_proj,
-            )
+
+            # Handle both fused gate-up and separate gate/up weights
+            if lw.gate_up_proj is not None:
+                layer_ops.mlp.set_weights(gate_up_proj=lw.gate_up_proj, down_proj=lw.down_proj)
+            elif lw.gate_proj is not None and lw.up_proj is not None:
+                layer_ops.mlp.set_weights(
+                    gate_proj=lw.gate_proj,
+                    up_proj=lw.up_proj,
+                    down_proj=lw.down_proj,
+                )
+            else:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: No MLP weights found. "
+                    f"Expected either gate_up_proj (fused) or gate_proj/up_proj (separate)."
+                )
 
         # Final norm
         self._final_norm.set_weights(w.final_norm)
@@ -251,14 +278,34 @@ class EngineRunner:
         # LM head
         self._lm_head.set_weights(w.lm_head)
 
-    def _allocate_scratch(self) -> None:
+    def _allocate_scratch(self, max_tokens: Optional[int] = None) -> None:
         """Pre-allocate scratch buffers for intermediate results.
 
         These are fixed-size buffers that get reused across steps.
         Per-step dynamic allocations happen via EngineStepContext.
+
+        Args:
+            max_tokens: Maximum tokens per step. If None, uses model_desc.max_position_embeddings
+                        capped at 4096. For decode-only engine, batch_size is typically the limit.
+
+        The allocated size determines the hard limit for tokens per step.
+        execute_step() will validate num_tokens <= _max_scratch_tokens.
         """
-        # Max tokens we might process in a single step
-        max_tokens = 4096  # TODO: Get from config
+        from .config import get_engine_config
+
+        # Determine max tokens for scratch buffers
+        if max_tokens is None:
+            # Use config max_batch_size (for decode, 1 token per seq = batch_size tokens)
+            # Fall back to model's max position, capped at a reasonable default
+            config = get_engine_config()
+            max_tokens = min(
+                config.max_batch_size,  # Engine config limit
+                self.model_desc.max_position_embeddings,  # Model limit
+                4096,  # Hard cap to prevent huge allocations
+            )
+
+        # Store for bounds checking in execute_step
+        self._max_scratch_tokens = max_tokens
 
         md = self.model_desc
         element_size = 2  # float16
@@ -278,8 +325,9 @@ class EngineRunner:
             logits_size_bytes, MTLResourceStorageModeShared
         )
 
-        logger.debug(
-            f"Allocated scratch buffers: hidden={2 * hidden_size_bytes / 1024 / 1024:.1f}MB, "
+        logger.info(
+            f"Allocated scratch buffers for max_tokens={max_tokens}: "
+            f"hidden={2 * hidden_size_bytes / 1024 / 1024:.1f}MB, "
             f"logits={logits_size_bytes / 1024 / 1024:.1f}MB"
         )
 
@@ -298,15 +346,48 @@ class EngineRunner:
         5. Submits and waits
         6. Returns logits on CPU
 
+        IMPORTANT: Currently only supports decode steps (num_tokens == num_seqs).
+        Prefill steps with num_tokens > num_seqs must be routed through PyTorch path.
+
         Args:
             step_desc: Step descriptor with metadata
             inputs: Input tensors (all on CPU)
 
         Returns:
             EngineOutputs with logits on CPU
+
+        Raises:
+            ValueError: If prefill step is passed (engine is decode-only for now)
         """
         self._step_counter += 1
         num_tokens = step_desc.num_scheduled_tokens
+        num_seqs = step_desc.num_seqs_active
+
+        # CRITICAL: Engine attention kernel only supports decode (1 token per seq).
+        # Prefill requires token-parallel attention which is not yet implemented.
+        # Route prefill through PyTorch path in AppleModelRunner._execute_forward().
+        if step_desc.is_prefill:
+            raise ValueError(
+                f"EngineRunner only supports decode steps. "
+                f"Prefill (num_tokens={num_tokens}, num_seqs={num_seqs}) must use PyTorch path. "
+                f"This is a correctness requirement: the attention kernel dispatches by "
+                f"(num_seqs, num_heads), not (num_tokens, num_heads)."
+            )
+
+        # Sanity check for decode: should have exactly 1 token per sequence
+        if num_tokens != num_seqs and num_tokens > 0:
+            logger.warning(
+                f"Decode step has num_tokens={num_tokens} != num_seqs={num_seqs}. "
+                f"This may indicate mixed prefill/decode which is not fully supported."
+            )
+
+        # Bounds check: prevent buffer overflow in scratch buffers
+        if num_tokens > self._max_scratch_tokens:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds scratch buffer capacity "
+                f"({self._max_scratch_tokens}). This would cause buffer overflow. "
+                f"Either reduce batch size or increase max_batch_size in engine config."
+            )
 
         if num_tokens == 0:
             # Empty step - return empty logits
@@ -708,13 +789,12 @@ class EngineRunner:
         if buffer is None:
             raise RuntimeError(f"Failed to allocate buffer for {name}")
 
-        # Copy data
+        # Copy data using PyObjC's as_buffer() (safe for PyObjC 12+)
         np_array = tensor.numpy()
-        ctypes.memmove(
-            buffer.contents(),
-            np_array.ctypes.data,
-            size_bytes,
-        )
+        # Get memoryview of MTLBuffer for safe copying
+        buffer_view = buffer.contents().as_buffer(size_bytes)
+        buffer_np = np.frombuffer(buffer_view, dtype=np_array.dtype)
+        np.copyto(buffer_np, np_array.ravel())
 
         return buffer
 
@@ -731,13 +811,9 @@ class EngineRunner:
         vocab_size = self.model_desc.vocab_size
         size_bytes = num_tokens * vocab_size * 2  # float16
 
-        # Read from buffer
-        np_array = np.zeros((num_tokens, vocab_size), dtype=np.float16)
-        ctypes.memmove(
-            np_array.ctypes.data,
-            self._logits_buffer.contents(),
-            size_bytes,
-        )
+        # Read from buffer using PyObjC's as_buffer() (safe for PyObjC 12+)
+        buffer_view = self._logits_buffer.contents().as_buffer(size_bytes)
+        np_array = np.frombuffer(buffer_view, dtype=np.float16).reshape(num_tokens, vocab_size).copy()
 
         # Convert to torch
         logits = torch.from_numpy(np_array)

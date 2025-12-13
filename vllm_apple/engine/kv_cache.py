@@ -472,6 +472,167 @@ class EngineKVCache:
             'stride_token': self._strides['token'],
         }
 
+    def sync_from_torch_cache(
+        self,
+        torch_caches: List["torch.Tensor"],
+        block_table: "torch.Tensor",
+        seq_lens: "torch.Tensor",
+    ) -> None:
+        """Sync KV data from torch cache to engine MTLBuffers.
+
+        This is called after prefill to ensure the engine's KV cache contains
+        the data written by the PyTorch attention path. This is necessary
+        because prefill uses PyTorch (torch cache) but decode uses engine
+        (MTLBuffer cache).
+
+        ⚠️ TEMPORARY STOP-GAP - NOT STRICT-MODE COMPLIANT ⚠️
+
+        This method violates two METAL_PLAN invariants:
+        1. KV cache single-source-of-truth: We have BOTH torch KV + engine KV (duplication)
+        2. No torch.mps.synchronize() in engine path: We call it here before reading
+
+        This is acceptable as a TRANSITIONAL solution until:
+        1. Prefill is moved to the engine (removing torch KV entirely), OR
+        2. Layouts are unified so torch and MTLBuffer can share memory (zero-copy)
+
+        DO NOT claim strict-mode compliance while using this sync bridge.
+        The engine path is only strict-mode compliant for decode-only batches
+        that don't require KV sync (e.g., continuing sequences).
+
+        The sync copies ONLY active blocks (based on block_table), avoiding
+        full cache materialization. Memory efficiency is critical here.
+
+        Args:
+            torch_caches: List of torch KV cache tensors, one per layer.
+                         Shape: [2, num_blocks, block_size, num_kv_heads, head_size]
+            block_table: Block table [num_seqs, max_blocks_per_seq]
+            seq_lens: Sequence lengths [num_seqs]
+
+        Layout conversion:
+            torch:  [2, num_blocks, block_size, num_kv_heads, head_size]
+            engine: [num_blocks, num_kv_heads, block_size, head_size]
+        """
+        import torch
+        import ctypes
+
+        if len(torch_caches) != self._desc.num_layers:
+            raise ValueError(
+                f"torch_caches has {len(torch_caches)} layers, "
+                f"expected {self._desc.num_layers}"
+            )
+
+        # SYNC BARRIER: Ensure torch cache writes are complete before reading.
+        # PyTorch prefill runs on MPS, we need to ensure GPU work is done.
+        # This is the "producer completed" guarantee required by the plan.
+        if torch_caches[0].device.type == 'mps':
+            import torch.mps
+            torch.mps.synchronize()
+            logger.debug("MPS sync completed before KV cache read")
+
+        # Get active block IDs from block_table (must be on CPU for iteration)
+        block_table_cpu = block_table.cpu() if block_table.device.type != 'cpu' else block_table
+        seq_lens_cpu = seq_lens.cpu() if seq_lens.device.type != 'cpu' else seq_lens
+
+        # Collect unique active block IDs
+        active_blocks = set()
+        for seq_idx in range(block_table_cpu.shape[0]):
+            seq_len = seq_lens_cpu[seq_idx].item()
+            num_blocks_needed = (seq_len + self._desc.block_size - 1) // self._desc.block_size
+            for block_idx in range(min(num_blocks_needed, block_table_cpu.shape[1])):
+                block_id = block_table_cpu[seq_idx, block_idx].item()
+                if block_id >= 0:  # Valid block
+                    active_blocks.add(block_id)
+
+        if not active_blocks:
+            logger.debug("No active blocks to sync")
+            return
+
+        logger.debug(f"Syncing {len(active_blocks)} active blocks from torch to engine KV cache")
+
+        # Get numpy views of engine MTLBuffers for safe writes
+        # Using PyObjC's as_buffer() for safe memory access
+        k_engine_views = []
+        v_engine_views = []
+        for layer_idx in range(self._desc.num_layers):
+            k_buffer = self._key_buffers[layer_idx]
+            v_buffer = self._value_buffers[layer_idx]
+
+            # Create numpy array viewing MTLBuffer memory
+            # Shape: [num_blocks, num_kv_heads, block_size, head_size]
+            # PyObjC 12+: buffer.contents() returns objc.varlist with as_buffer() method
+            # This gives us a memoryview that numpy can directly use
+            try:
+                k_memview = k_buffer.contents().as_buffer(self._bytes_per_layer)
+                v_memview = v_buffer.contents().as_buffer(self._bytes_per_layer)
+            except (AttributeError, TypeError) as e:
+                logger.error(f"Failed to get MTLBuffer contents: {e}")
+                raise RuntimeError(
+                    f"Cannot access MTLBuffer contents. Ensure storageModeShared is used "
+                    f"and PyObjC 12+ is installed. Error: {e}"
+                )
+
+            # Create numpy arrays from memoryview (writable, zero-copy view)
+            dtype = np.float16 if self._dtype_size == 2 else np.float32
+            k_view = np.frombuffer(k_memview, dtype=dtype).reshape(
+                self._desc.num_blocks,
+                self._desc.num_kv_heads,
+                self._desc.block_size,
+                self._desc.head_size,
+            )
+            v_view = np.frombuffer(v_memview, dtype=dtype).reshape(
+                self._desc.num_blocks,
+                self._desc.num_kv_heads,
+                self._desc.block_size,
+                self._desc.head_size,
+            )
+            k_engine_views.append(k_view)
+            v_engine_views.append(v_view)
+
+        # Sync each layer - copy only active blocks
+        # CRITICAL: Do NOT call contiguous() on entire cache - only per-block
+        for layer_idx in range(self._desc.num_layers):
+            torch_kv = torch_caches[layer_idx]  # [2, num_blocks, block_size, num_kv_heads, head_size]
+
+            # torch_kv[0] is K, torch_kv[1] is V
+            k_torch = torch_kv[0]  # [num_blocks, block_size, num_kv_heads, head_size]
+            v_torch = torch_kv[1]
+
+            k_engine = k_engine_views[layer_idx]
+            v_engine = v_engine_views[layer_idx]
+
+            for block_id in active_blocks:
+                if block_id >= self._desc.num_blocks:
+                    continue  # Safety check
+
+                # Extract single block and transpose to engine layout
+                # torch: [block_size, num_kv_heads, head_size]
+                # engine: [num_kv_heads, block_size, head_size]
+                # Only this single block is made contiguous, not the entire cache
+                k_block_torch = k_torch[block_id].permute(1, 0, 2).contiguous()
+                v_block_torch = v_torch[block_id].permute(1, 0, 2).contiguous()
+
+                # Move to CPU and convert to numpy
+                k_block_np = k_block_torch.cpu().numpy()
+                v_block_np = v_block_torch.cpu().numpy()
+
+                # Copy to engine buffer using numpy indexing (safe, no pointer arithmetic)
+                k_engine[block_id] = k_block_np
+                v_engine[block_id] = v_block_np
+
+        logger.debug(f"KV cache sync complete for {len(active_blocks)} blocks")
+
+    def supports_torch_sync(self) -> bool:
+        """Check if torch cache sync is supported.
+
+        Returns True if the MTLBuffers use storageModeShared which allows
+        CPU access to the buffer memory for copying.
+
+        Returns:
+            True if sync is supported, False otherwise.
+        """
+        # storageModeShared buffers support CPU access
+        return True
+
 
 class EngineKVCachePool:
     """Pool of KV caches for multi-model or multi-instance scenarios.

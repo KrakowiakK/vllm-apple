@@ -101,9 +101,11 @@ class EngineMLP:
         )
 
         # Weight buffers
-        self._gate_proj = None  # [hidden_size, intermediate_size]
-        self._up_proj = None    # [hidden_size, intermediate_size]
-        self._down_proj = None  # [intermediate_size, hidden_size]
+        self._gate_proj = None      # [intermediate_size, hidden_size]
+        self._up_proj = None        # [intermediate_size, hidden_size]
+        self._gate_up_proj = None   # Fused [2*intermediate_size, hidden_size]
+        self._down_proj = None      # [hidden_size, intermediate_size]
+        self._fused_gate_up = False # Track whether using fused weights
 
         # Bias buffers (optional)
         self._gate_bias = None
@@ -122,28 +124,44 @@ class EngineMLP:
 
     def set_weights(
         self,
-        gate_proj: Optional[Any] = None,  # MTLBuffer [hidden, intermediate]
-        up_proj: Optional[Any] = None,    # MTLBuffer [hidden, intermediate]
-        down_proj: Optional[Any] = None,  # MTLBuffer [intermediate, hidden]
+        gate_proj: Optional[Any] = None,     # MTLBuffer [intermediate, hidden]
+        up_proj: Optional[Any] = None,       # MTLBuffer [intermediate, hidden]
+        down_proj: Optional[Any] = None,     # MTLBuffer [hidden, intermediate]
+        gate_up_proj: Optional[Any] = None,  # Fused [2*intermediate, hidden]
         gate_bias: Optional[Any] = None,
         up_bias: Optional[Any] = None,
         down_bias: Optional[Any] = None,
     ) -> None:
         """Set weight buffers.
 
-        For gated MLP: provide gate_proj, up_proj, down_proj
+        For gated MLP: provide either:
+        - gate_proj + up_proj + down_proj (separate weights)
+        - gate_up_proj + down_proj (fused vLLM style)
+
         For standard MLP: provide up_proj, down_proj (gate_proj ignored)
 
         Args:
-            gate_proj: Gate projection weights (gated MLP only)
-            up_proj: Up projection weights
-            down_proj: Down projection weights
+            gate_proj: Gate projection weights [intermediate, hidden] (gated MLP only)
+            up_proj: Up projection weights [intermediate, hidden]
+            down_proj: Down projection weights [hidden, intermediate]
+            gate_up_proj: Fused gate+up weights [2*intermediate, hidden]
             gate_bias: Gate projection bias
             up_bias: Up projection bias
             down_bias: Down projection bias
         """
-        self._gate_proj = gate_proj
-        self._up_proj = up_proj
+        if gate_up_proj is not None:
+            # Fused gate-up weights (vLLM style)
+            self._gate_up_proj = gate_up_proj
+            self._gate_proj = None
+            self._up_proj = None
+            self._fused_gate_up = True
+        else:
+            # Separate gate and up weights
+            self._gate_proj = gate_proj
+            self._up_proj = up_proj
+            self._gate_up_proj = None
+            self._fused_gate_up = False
+
         self._down_proj = down_proj
         self._gate_bias = gate_bias
         self._up_bias = up_bias
@@ -170,11 +188,19 @@ class EngineMLP:
                                 since 3 separate buffers are needed).
                                 If None, allocates from scratch pool.
         """
-        if self._up_proj is None or self._down_proj is None:
-            raise RuntimeError("Weights not set - call set_weights() first")
+        if self._down_proj is None:
+            raise RuntimeError("Down projection weights not set - call set_weights() first")
 
-        if self.config.gated and self._gate_proj is None:
-            raise RuntimeError("Gate projection weights not set for gated MLP")
+        # Check for either fused or separate weights
+        if self.config.gated:
+            if not self._fused_gate_up and (self._gate_proj is None or self._up_proj is None):
+                raise RuntimeError(
+                    "Gate and up projection weights not set for gated MLP. "
+                    "Provide either gate_up_proj (fused) or gate_proj + up_proj (separate)."
+                )
+        else:
+            if self._up_proj is None:
+                raise RuntimeError("Up projection weights not set for standard MLP")
 
         if not step_ctx.is_encoding:
             raise RuntimeError("encode() called outside ENCODE phase")
@@ -231,56 +257,108 @@ class EngineMLP:
         """Encode gated MLP.
 
         Computes: down_proj(silu(gate_proj(x)) * up_proj(x))
+
+        Supports both:
+        - Fused gate_up_proj weights (single GEMM, split output)
+        - Separate gate_proj + up_proj weights (two GEMMs)
         """
         H = self.config.hidden_size
         I = self.config.intermediate_size
 
-        # Step 1: gate_proj(x) -> gate_intermediate
-        # [num_tokens, H] @ [I, H]^T -> [num_tokens, I]
-        # PyTorch weight is [out, in] = [I, H], need transpose
-        self._gemm.encode(
-            step_ctx=step_ctx,
-            A=hidden_states,
-            B=self._gate_proj,
-            C=gate_intermediate,
-            M=num_tokens,
-            K=H,
-            N=I,
-            transpose_B=True,  # PyTorch weight is [I, H]
-        )
+        if self._fused_gate_up:
+            # Fused gate-up projection: single GEMM with 2*I output
+            # [num_tokens, H] @ [2*I, H]^T -> [num_tokens, 2*I]
+            # Output layout: [gate_output | up_output] = [num_tokens, 2*I]
 
-        # Step 2: up_proj(x) -> up_intermediate
-        # [num_tokens, H] @ [I, H]^T -> [num_tokens, I]
-        self._gemm.encode(
-            step_ctx=step_ctx,
-            A=hidden_states,
-            B=self._up_proj,
-            C=up_intermediate,
-            M=num_tokens,
-            K=H,
-            N=I,
-            transpose_B=True,  # PyTorch weight is [I, H]
-        )
+            # Allocate buffer for combined gate+up output
+            gate_up_size_bytes = num_tokens * 2 * I * 2  # float16
+            gate_up_combined = step_ctx.allocate_scratch(gate_up_size_bytes)
 
-        # Memory barrier after GEMMs
-        step_ctx.memory_barrier()
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=self._gate_up_proj,
+                C=gate_up_combined,
+                M=num_tokens,
+                K=H,
+                N=2 * I,
+                transpose_B=True,  # Weight is [2*I, H]
+            )
 
-        # Step 3: silu(gate) * up -> fused_intermediate
-        num_intermediate_elements = num_tokens * I
-        self._elementwise.encode_silu_mul(
-            step_ctx=step_ctx,
-            gate=gate_intermediate,
-            up=up_intermediate,
-            output=fused_intermediate,
-            num_elements=num_intermediate_elements,
-        )
+            # Memory barrier after GEMM
+            step_ctx.memory_barrier()
+
+            # Split the output and apply silu_mul
+            # gate is at offset 0, up is at offset I*2 (bytes per element = 2 for float16)
+            gate_tensor = EngineTensor(
+                buffer=gate_up_combined,
+                shape=(num_tokens, I),
+                dtype=EngineDType.FLOAT16,
+                offset=0,
+            )
+            up_tensor = EngineTensor(
+                buffer=gate_up_combined,
+                shape=(num_tokens, I),
+                dtype=EngineDType.FLOAT16,
+                offset=num_tokens * I * 2,  # After gate values
+            )
+
+            # silu(gate) * up -> fused_intermediate
+            num_intermediate_elements = num_tokens * I
+            self._elementwise.encode_silu_mul(
+                step_ctx=step_ctx,
+                gate=gate_tensor,
+                up=up_tensor,
+                output=fused_intermediate,
+                num_elements=num_intermediate_elements,
+            )
+        else:
+            # Separate gate and up projections: two GEMMs
+
+            # Step 1: gate_proj(x) -> gate_intermediate
+            # [num_tokens, H] @ [I, H]^T -> [num_tokens, I]
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=self._gate_proj,
+                C=gate_intermediate,
+                M=num_tokens,
+                K=H,
+                N=I,
+                transpose_B=True,  # PyTorch weight is [I, H]
+            )
+
+            # Step 2: up_proj(x) -> up_intermediate
+            # [num_tokens, H] @ [I, H]^T -> [num_tokens, I]
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=self._up_proj,
+                C=up_intermediate,
+                M=num_tokens,
+                K=H,
+                N=I,
+                transpose_B=True,  # PyTorch weight is [I, H]
+            )
+
+            # Memory barrier after GEMMs
+            step_ctx.memory_barrier()
+
+            # Step 3: silu(gate) * up -> fused_intermediate
+            num_intermediate_elements = num_tokens * I
+            self._elementwise.encode_silu_mul(
+                step_ctx=step_ctx,
+                gate=gate_intermediate,
+                up=up_intermediate,
+                output=fused_intermediate,
+                num_elements=num_intermediate_elements,
+            )
 
         # Memory barrier after elementwise
         step_ctx.memory_barrier()
 
-        # Step 4: down_proj(fused_intermediate) -> output
+        # Final step: down_proj(fused_intermediate) -> output
         # [num_tokens, I] @ [H, I]^T -> [num_tokens, H]
-        # PyTorch weight is [out, in] = [H, I], need transpose
         self._gemm.encode(
             step_ctx=step_ctx,
             A=fused_intermediate,

@@ -86,6 +86,7 @@ from .descriptors import (
     EngineOutputs,
     KVCacheDescriptor,
     ModelDescriptor,
+    SUPPORTED_ENGINE_ARCHITECTURES,
 )
 
 # Direct class imports (for type hints and direct instantiation)
@@ -147,6 +148,7 @@ __all__ = [
     "EngineOutputs",
     "KVCacheDescriptor",
     "ModelDescriptor",
+    "SUPPORTED_ENGINE_ARCHITECTURES",
     # Core classes
     "MetalEngineContext",
     "EngineStepContext",
