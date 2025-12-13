@@ -455,6 +455,83 @@ class AppleModelRunner:
             total_cache_gb,
         )
 
+        # Complete engine runner initialization if engine mode enabled
+        if self._use_engine_mode and hasattr(self, '_engine_context'):
+            self._complete_engine_runner_init(num_blocks, kv_cache_spec)
+
+    def _complete_engine_runner_init(
+        self,
+        num_blocks: int,
+        kv_cache_spec: dict,
+    ) -> None:
+        """Complete engine runner initialization after KV cache is allocated.
+
+        This creates:
+        1. EngineKVCache wrapping the allocated KV caches
+        2. Loads model weights to MTLBuffer
+        3. Creates the final EngineRunner
+
+        Args:
+            num_blocks: Number of KV cache blocks
+            kv_cache_spec: KV cache specifications per layer
+        """
+        from vllm_apple.engine import (
+            EngineKVCache,
+            EngineRunner,
+            EngineWeightLoader,
+            KVCacheDescriptor,
+        )
+
+        logger.info("Completing engine runner initialization...")
+
+        # Get first layer spec for cache configuration
+        first_spec = next(iter(kv_cache_spec.values()))
+        num_kv_heads = first_spec.num_kv_heads if hasattr(first_spec, 'num_kv_heads') else 8
+        head_size = first_spec.head_size if hasattr(first_spec, 'head_size') else 128
+
+        # Create KV cache descriptor
+        kv_desc = KVCacheDescriptor(
+            num_blocks=num_blocks,
+            block_size=self.block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            num_layers=len(self.kv_caches),
+        )
+
+        # Create engine KV cache
+        # The engine will use MTLBuffer for KV storage
+        engine_kv_cache = EngineKVCache(
+            context=self._engine_context,
+            desc=kv_desc,
+        )
+
+        # Load weights from PyTorch model to MTLBuffer
+        weight_loader = EngineWeightLoader(
+            context=self._engine_context,
+            model_config=self.model_config,
+        )
+
+        # Determine architecture from model type
+        model_type = getattr(self.model_config.hf_config, 'model_type', 'llama')
+        arch = 'qwen2' if 'qwen' in model_type.lower() else 'llama'
+
+        weights = weight_loader.load_from_hf_model(self.model, arch=arch)
+
+        # Create the engine runner
+        self._engine_runner = EngineRunner(
+            context=self._engine_context,
+            model_desc=self._engine_model_desc,
+            weights=weights,
+            kv_cache=engine_kv_cache,
+        )
+
+        logger.info(
+            "Engine runner ready: %d layers, KV cache: %d blocks x %d",
+            self._engine_model_desc.num_layers,
+            num_blocks,
+            self.block_size,
+        )
+
     def profile_run(self) -> None:
         """Run a profiling pass to measure memory usage.
 
