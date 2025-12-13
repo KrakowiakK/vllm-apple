@@ -358,6 +358,125 @@ kernel void paged_attention_decode(
     }
 }
 
+/**
+ * PagedAttention V2 - Prefill kernel (token-parallel, causal)
+ *
+ * Dispatch grid: (num_tokens, num_query_heads)
+ * - gid.x: token index in the flattened query batch
+ * - gid.y: query head index
+ *
+ * Requires:
+ * - token_to_seq[token_idx] gives the sequence index for this token
+ * - positions[token_idx] gives the absolute position in the sequence
+ *
+ * The kernel computes causal attention for each token at its position,
+ * attending to KV cache positions [0..pos] for that sequence.
+ */
+kernel void paged_attention_v2_prefill(
+    device const half* query [[buffer(0)]],
+    device const half* key_cache [[buffer(1)]],
+    device const half* value_cache [[buffer(2)]],
+    device const int* block_table [[buffer(3)]],
+    device const int* token_to_seq [[buffer(4)]],
+    device const int* positions [[buffer(5)]],
+    device half* output [[buffer(6)]],
+    constant PagedAttentionParams& params [[buffer(7)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    const uint token_idx = gid.x;
+    const uint query_head_idx = gid.y;
+
+    if (query_head_idx >= params.num_query_heads) return;
+
+    const int seq_idx_i = token_to_seq[token_idx];
+    if (seq_idx_i < 0 || uint(seq_idx_i) >= params.num_seqs) return;
+    const uint seq_idx = uint(seq_idx_i);
+
+    const int pos_i = positions[token_idx];
+    if (pos_i < 0) return;
+    const uint context_len = uint(pos_i + 1);
+
+    const uint num_blocks = (context_len + params.block_size - 1) / params.block_size;
+    if (num_blocks > params.max_blocks_per_seq) return;
+
+    const uint kv_head_idx = query_head_idx / params.queries_per_kv;
+    const uint bt_base = seq_idx * params.max_blocks_per_seq;
+    const uint q_offset = token_idx * params.q_stride_token + query_head_idx * params.q_stride_head;
+
+    const uint dims_per_lane = (params.head_size + 31) / 32;
+    if (dims_per_lane > 4) {
+        if (simd_lane == 0) {
+            output[token_idx * params.o_stride_token + query_head_idx * params.o_stride_head] =
+                half(0.0f / 0.0f);
+        }
+        return;
+    }
+
+    float q_reg[4];
+    for (uint i = 0; i < dims_per_lane; i++) {
+        uint dim_idx = i * 32 + simd_lane;
+        q_reg[i] = (dim_idx < params.head_size) ? float(query[q_offset + dim_idx]) : 0.0f;
+    }
+
+    float m_prev = -INFINITY;
+    float l_prev = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
+        const int physical_block = block_table[bt_base + block_idx];
+        if (physical_block < 0) return;
+
+        const uint tokens_in_block =
+            min(params.block_size, context_len - block_idx * params.block_size);
+
+        const uint kv_block_offset = uint(physical_block) * params.k_stride_block
+                                   + kv_head_idx * params.k_stride_head;
+
+        for (uint token_offset = 0; token_offset < tokens_in_block; token_offset++) {
+            const uint kv_token_offset = kv_block_offset + token_offset * params.k_stride_token;
+
+            float score = 0.0f;
+            for (uint i = 0; i < dims_per_lane; i++) {
+                uint dim_idx = i * 32 + simd_lane;
+                if (dim_idx < params.head_size) {
+                    float k_val = float(key_cache[kv_token_offset + dim_idx]);
+                    score += q_reg[i] * k_val;
+                }
+            }
+            score = simd_sum(score) * params.scale;
+
+            const float m_new = max(m_prev, score);
+            const float exp_prev = exp(m_prev - m_new);
+            const float exp_curr = exp(score - m_new);
+
+            for (uint i = 0; i < dims_per_lane; i++) {
+                acc[i] *= exp_prev;
+            }
+            l_prev = l_prev * exp_prev + exp_curr;
+            m_prev = m_new;
+
+            for (uint i = 0; i < dims_per_lane; i++) {
+                uint dim_idx = i * 32 + simd_lane;
+                if (dim_idx < params.head_size) {
+                    float v_val = float(value_cache[kv_token_offset + dim_idx]);
+                    acc[i] += exp_curr * v_val;
+                }
+            }
+        }
+    }
+
+    const uint o_offset = token_idx * params.o_stride_token + query_head_idx * params.o_stride_head;
+    const float inv_l = (l_prev > 0.0f) ? 1.0f / l_prev : 0.0f;
+
+    for (uint i = 0; i < dims_per_lane; i++) {
+        uint dim_idx = i * 32 + simd_lane;
+        if (dim_idx < params.head_size) {
+            output[o_offset + dim_idx] = half(acc[i] * inv_l);
+        }
+    }
+}
+
 kernel void test_copy(
     device const half* input [[buffer(0)]],
     device half* output [[buffer(1)]],

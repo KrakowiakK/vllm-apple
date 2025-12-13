@@ -53,7 +53,11 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.utils import bind_kv_cache
 
 # Engine mode imports (v2.0 Metal engine)
-from vllm_apple.engine import is_engine_mode_enabled, is_strict_mode
+from vllm_apple.engine import (
+    is_engine_mode_enabled,
+    is_engine_prefill_enabled,
+    is_strict_mode,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -192,6 +196,7 @@ class AppleModelRunner:
         This implements step-aware device selection per METAL_PLAN.md:
         - Prefill steps: MPS (PyTorch model needs MPS inputs)
         - Decode-only steps in engine mode: CPU (engine needs CPU inputs)
+        - Prefill steps in engine mode (opt-in): CPU (engine needs CPU inputs)
         - Decode steps without engine mode: MPS (PyTorch path)
 
         By preparing inputs on the correct device from the start, we avoid
@@ -203,13 +208,14 @@ class AppleModelRunner:
         Returns:
             Device for input tensor preparation
         """
-        if self._use_engine_mode and self._engine_runner is not None and is_decode_only:
-            # Engine decode: prepare inputs on CPU directly
-            # This avoids MPS→CPU conversion overhead at boundary
-            return torch.device("cpu")
-        else:
-            # Prefill or non-engine path: PyTorch model needs MPS inputs
-            return self.device
+        if self._use_engine_mode and self._engine_runner is not None:
+            if is_decode_only or is_engine_prefill_enabled():
+                # Engine decode (and optionally engine prefill): prepare inputs on CPU directly.
+                # This avoids forbidden MPS→CPU conversions at the engine boundary.
+                return torch.device("cpu")
+
+        # Prefill or non-engine path: PyTorch model needs MPS inputs.
+        return self.device
 
     def _is_decode_only_step(self, scheduler_output: "SchedulerOutput") -> bool:
         """Check if this step contains only decode requests (no prefill).
@@ -1300,21 +1306,19 @@ class AppleModelRunner:
             # Check if this is a prefill step - engine only supports decode
             # Detect prefill from attn_metadata: num_decode_tokens < num_actual_tokens
             attn_metadata = model_input.attn_metadata
-            is_prefill = attn_metadata.num_decode_tokens < attn_metadata.num_actual_tokens
+            has_prefill = attn_metadata.num_decode_tokens < attn_metadata.num_actual_tokens
 
-            if is_prefill:
-                # Route prefill through PyTorch path
-                # Engine attention kernel only supports decode (1 token per seq)
+            if has_prefill and not is_engine_prefill_enabled():
+                # Default behavior: route prefill through PyTorch and sync KV for decode.
                 logger.debug(
                     f"Prefill step (num_tokens={model_input.num_scheduled_tokens}, "
                     f"num_decode={attn_metadata.num_decode_tokens}) - using PyTorch path"
                 )
-                # Execute prefill via PyTorch, then sync KV cache to engine
                 result = self._execute_prefill_and_sync_kv(model_input)
                 return result, False  # Returns hidden states, not logits
-            else:
-                # Decode step - use engine
-                return self._execute_forward_engine(model_input), True
+
+            # Engine path (decode-only or prefill enabled): return logits.
+            return self._execute_forward_engine(model_input), True
         elif self._use_engine_mode:
             # Engine mode enabled but runner not initialized
             if is_strict_mode():
@@ -1469,6 +1473,7 @@ class AppleModelRunner:
             block_table=ensure_cpu_tensor(attn_metadata.block_table, "block_table") if attn_metadata.block_table is not None else torch.empty(0, 0, dtype=torch.int32),
             slot_mapping=ensure_cpu_tensor(attn_metadata.slot_mapping, "slot_mapping") if attn_metadata.slot_mapping is not None else torch.empty(0, dtype=torch.int32),
             seq_lens=ensure_cpu_tensor(attn_metadata.seq_lens.to(dtype=torch.int32), "seq_lens"),
+            query_start_locs=ensure_cpu_tensor(attn_metadata.query_start_loc, "query_start_locs"),
         )
 
         # Execute via engine runner

@@ -237,22 +237,26 @@ kernel void paged_attention_fused_generic(
     const uint new_token_offset = new_token_pos % params.block_size;
     const int new_physical_block = block_table[bt_base + new_block_idx];
 
-    const bool should_write_kv = (query_head_idx % params.queries_per_kv == 0);
+    // IMPORTANT: This kernel dispatches by (num_seqs, num_query_heads).
+    // When using GQA (queries_per_kv > 1), multiple query heads map to the same
+    // KV head. There is no cross-threadgroup barrier in Metal, so relying on a
+    // single query-head threadgroup to populate KV for others is unsafe.
+    //
+    // For correctness, each threadgroup writes the KV slice for its kv_head_idx
+    // before computing attention. This duplicates KV writes under GQA, but avoids
+    // races and preserves deterministic results.
+    const uint kv_write_base = new_physical_block * params.k_stride_block
+                             + kv_head_idx * params.k_stride_head
+                             + new_token_offset * params.k_stride_token;
 
-    if (should_write_kv) {
-        const uint kv_write_base = new_physical_block * params.k_stride_block
-                                 + kv_head_idx * params.k_stride_head
-                                 + new_token_offset * params.k_stride_token;
+    const uint new_kv_offset = seq_idx * params.new_kv_stride_token
+                             + kv_head_idx * params.new_kv_stride_head;
 
-        const uint new_kv_offset = seq_idx * params.new_kv_stride_token
-                                 + kv_head_idx * params.new_kv_stride_head;
-
-        for (uint i = 0; i < dims_per_lane && i < 4; i++) {
-            uint dim_idx = simd_lane + i * 32;
-            if (dim_idx < head_size) {
-                key_cache[kv_write_base + dim_idx] = new_keys[new_kv_offset + dim_idx];
-                value_cache[kv_write_base + dim_idx] = new_values[new_kv_offset + dim_idx];
-            }
+    for (uint i = 0; i < dims_per_lane && i < 4; i++) {
+        uint dim_idx = simd_lane + i * 32;
+        if (dim_idx < head_size) {
+            key_cache[kv_write_base + dim_idx] = new_keys[new_kv_offset + dim_idx];
+            value_cache[kv_write_base + dim_idx] = new_values[new_kv_offset + dim_idx];
         }
     }
 

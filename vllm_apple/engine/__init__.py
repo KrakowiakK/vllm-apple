@@ -22,6 +22,7 @@ Usage:
 
 Environment Variables:
     VLLM_APPLE_USE_ENGINE: Enable v2.0 engine mode (default: 0)
+    VLLM_APPLE_ENGINE_PREFILL: Enable engine prefill/mixed steps (default: 0)
     VLLM_METAL_STRICT_NO_MPS: Strict mode - raise on MPS in hot path (default: 0)
     VLLM_METAL_PROFILE: Enable step-level profiling (default: 0)
     VLLM_METAL_CAPTURE_NEXT_STEP: Capture GPU trace via MTLCaptureManager (default: 0)
@@ -45,8 +46,10 @@ Module Structure:
 from .config import (
     EngineConfig,
     is_engine_mode_enabled,
+    is_engine_prefill_enabled,
     get_engine_config,
     ENGINE_MODE_ENV,
+    ENGINE_PREFILL_ENV,
     STRICT_MODE_ENV,
     PROFILE_ENV,
     CAPTURE_TRACE_ENV,
@@ -119,8 +122,10 @@ __all__ = [
     # Config
     "EngineConfig",
     "is_engine_mode_enabled",
+    "is_engine_prefill_enabled",
     "get_engine_config",
     "ENGINE_MODE_ENV",
+    "ENGINE_PREFILL_ENV",
     "STRICT_MODE_ENV",
     "PROFILE_ENV",
     "CAPTURE_TRACE_ENV",

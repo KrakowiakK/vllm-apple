@@ -311,70 +311,101 @@ class MetalPagedAttentionFused:
         # Create command buffer
         command_buffer = self.command_queue.commandBuffer()
 
-        # =====================================================================
-        # PHASE 1: KV WRITE KERNEL
-        # Writes new K/V to cache before attention computes
-        # =====================================================================
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self.kv_write_pipeline)
+        if self.kernel_name == "paged_attention_fused_h128":
+            # =================================================================
+            # Two-phase path (preferred for head_size=128):
+            #   1) KV write kernel
+            #   2) Attention kernel that reads already-written KV
+            # =================================================================
+            encoder = command_buffer.computeCommandEncoder()
+            encoder.setComputePipelineState_(self.kv_write_pipeline)
 
-        # KV write kernel buffer layout:
-        # buffer(0): key_cache (writable)
-        # buffer(1): value_cache (writable)
-        # buffer(2): block_table
-        # buffer(3): seq_lens
-        # buffer(4): params
-        # buffer(5): new_keys
-        # buffer(6): new_values
-        encoder.setBuffer_offset_atIndex_(key_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(value_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(block_table_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(seq_lens_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(params_buffer, 0, 4)
-        encoder.setBuffer_offset_atIndex_(new_keys_buffer, 0, 5)
-        encoder.setBuffer_offset_atIndex_(new_values_buffer, 0, 6)
+            # KV write kernel buffer layout:
+            # buffer(0): key_cache (writable)
+            # buffer(1): value_cache (writable)
+            # buffer(2): block_table
+            # buffer(3): seq_lens
+            # buffer(4): params
+            # buffer(5): new_keys
+            # buffer(6): new_values
+            encoder.setBuffer_offset_atIndex_(key_buffer, 0, 0)
+            encoder.setBuffer_offset_atIndex_(value_buffer, 0, 1)
+            encoder.setBuffer_offset_atIndex_(block_table_buffer, 0, 2)
+            encoder.setBuffer_offset_atIndex_(seq_lens_buffer, 0, 3)
+            encoder.setBuffer_offset_atIndex_(params_buffer, 0, 4)
+            encoder.setBuffer_offset_atIndex_(new_keys_buffer, 0, 5)
+            encoder.setBuffer_offset_atIndex_(new_values_buffer, 0, 6)
 
-        # KV write dispatch: (num_seqs, num_kv_heads) threadgroups
-        threads_per_threadgroup = MTLSize(32, 1, 1)
-        kv_write_threadgroups = MTLSize(num_seqs, self.num_kv_heads, 1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(
-            kv_write_threadgroups, threads_per_threadgroup
-        )
-        encoder.endEncoding()
+            # KV write dispatch: (num_seqs, num_kv_heads) threadgroups
+            threads_per_threadgroup = MTLSize(32, 1, 1)
+            kv_write_threadgroups = MTLSize(num_seqs, self.num_kv_heads, 1)
+            encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                kv_write_threadgroups, threads_per_threadgroup
+            )
+            encoder.endEncoding()
 
-        # =====================================================================
-        # PHASE 2: ATTENTION KERNEL
-        # Computes attention with fully populated KV cache
-        # =====================================================================
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self.pipeline_state)
+            encoder = command_buffer.computeCommandEncoder()
+            encoder.setComputePipelineState_(self.pipeline_state)
 
-        # Attention kernel buffer layout:
-        # buffer(0): query
-        # buffer(1): key_cache (read-only now)
-        # buffer(2): value_cache (read-only now)
-        # buffer(3): block_table
-        # buffer(4): seq_lens
-        # buffer(5): output
-        # buffer(6): params
-        encoder.setBuffer_offset_atIndex_(query_buffer_local, 0, 0)
-        encoder.setBuffer_offset_atIndex_(key_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(value_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(block_table_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(seq_lens_buffer, 0, 4)
-        encoder.setBuffer_offset_atIndex_(output_buffer, 0, 5)
-        encoder.setBuffer_offset_atIndex_(params_buffer, 0, 6)
+            # Attention kernel buffer layout:
+            # buffer(0): query
+            # buffer(1): key_cache (read-only)
+            # buffer(2): value_cache (read-only)
+            # buffer(3): block_table
+            # buffer(4): seq_lens
+            # buffer(5): output
+            # buffer(6): params
+            encoder.setBuffer_offset_atIndex_(query_buffer_local, 0, 0)
+            encoder.setBuffer_offset_atIndex_(key_buffer, 0, 1)
+            encoder.setBuffer_offset_atIndex_(value_buffer, 0, 2)
+            encoder.setBuffer_offset_atIndex_(block_table_buffer, 0, 3)
+            encoder.setBuffer_offset_atIndex_(seq_lens_buffer, 0, 4)
+            encoder.setBuffer_offset_atIndex_(output_buffer, 0, 5)
+            encoder.setBuffer_offset_atIndex_(params_buffer, 0, 6)
 
-        # Attention dispatch: (num_seqs, num_query_heads) threadgroups
-        # Each threadgroup is 32 threads (one SIMD group)
-        threads_per_threadgroup = MTLSize(32, 1, 1)
-        threadgroups = MTLSize(num_seqs, self.num_query_heads, 1)
+            threads_per_threadgroup = MTLSize(32, 1, 1)
+            threadgroups = MTLSize(num_seqs, self.num_query_heads, 1)
+            encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                threadgroups, threads_per_threadgroup
+            )
+            encoder.endEncoding()
+        elif self.kernel_name == "paged_attention_fused_generic":
+            # =================================================================
+            # Single-dispatch fused path:
+            #   - Kernel writes new K/V and computes attention.
+            # =================================================================
+            encoder = command_buffer.computeCommandEncoder()
+            encoder.setComputePipelineState_(self.pipeline_state)
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(
-            threadgroups, threads_per_threadgroup
-        )
+            # Generic fused kernel buffer layout:
+            # buffer(0): query
+            # buffer(1): key_cache (writable)
+            # buffer(2): value_cache (writable)
+            # buffer(3): block_table
+            # buffer(4): seq_lens
+            # buffer(5): output
+            # buffer(6): params
+            # buffer(7): new_keys
+            # buffer(8): new_values
+            encoder.setBuffer_offset_atIndex_(query_buffer_local, 0, 0)
+            encoder.setBuffer_offset_atIndex_(key_buffer, 0, 1)
+            encoder.setBuffer_offset_atIndex_(value_buffer, 0, 2)
+            encoder.setBuffer_offset_atIndex_(block_table_buffer, 0, 3)
+            encoder.setBuffer_offset_atIndex_(seq_lens_buffer, 0, 4)
+            encoder.setBuffer_offset_atIndex_(output_buffer, 0, 5)
+            encoder.setBuffer_offset_atIndex_(params_buffer, 0, 6)
+            encoder.setBuffer_offset_atIndex_(new_keys_buffer, 0, 7)
+            encoder.setBuffer_offset_atIndex_(new_values_buffer, 0, 8)
 
-        encoder.endEncoding()
+            threads_per_threadgroup = MTLSize(32, 1, 1)
+            threadgroups = MTLSize(num_seqs, self.num_query_heads, 1)
+            encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                threadgroups, threads_per_threadgroup
+            )
+            encoder.endEncoding()
+        else:
+            raise RuntimeError(f"Unsupported fused kernel: {self.kernel_name}")
+
         command_buffer.commit()
         command_buffer.waitUntilCompleted()
 

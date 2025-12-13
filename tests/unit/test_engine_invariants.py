@@ -210,13 +210,14 @@ class TestPrefillDecodeDispatch:
     """Tests for prefill vs decode dispatch.
 
     BUG FIXED: The engine attention kernel dispatches by (num_seqs, num_heads),
-    NOT (num_tokens, num_heads). For prefill where num_tokens > num_seqs,
-    this produces incorrect results. The kernel was treating prefill as if
-    each sequence only had 1 token.
+    NOT (num_tokens, num_heads). For prefill/mixed steps where num_tokens > num_seqs,
+    dispatching by num_seqs produces incorrect results (only the first token per
+    sequence is processed).
 
-    INVARIANT: Engine must route prefill through PyTorch path until
-    token-parallel attention is implemented. Decode (1 token per seq)
-    can use the engine.
+    INVARIANT: Prefill/mixed steps must use token-parallel attention
+    (dispatch by num_tokens) with explicit token→sequence metadata (e.g.,
+    query_start_locs / token_to_seq + positions) to apply causal masking.
+    Decode-only steps can use the faster per-sequence dispatch.
 
     Reference: METAL_PLAN.md Phase 1.3 - Paged attention + KV-write as engine ops
     """
@@ -264,19 +265,15 @@ class TestPrefillDecodeDispatch:
         - num_tokens = total tokens in the batch (could be 128 for a 128-token prompt)
         - num_seqs = number of sequences (could be 1 for a single request)
 
-        The attention kernel dispatches (num_seqs, num_heads) threads.
-        If we have 128 tokens but only 1 seq, only 1 row of Q is processed!
+        Prefill attention must be token-parallel (num_tokens, num_heads); decode
+        attention can be sequence-parallel (num_seqs, num_heads).
         """
-        # This test documents the invariant
+        # This test documents the shape relationship.
         num_tokens = 128  # Prompt length
         num_seqs = 1  # Single sequence
 
         # In prefill, num_tokens > num_seqs
         assert num_tokens > num_seqs, "Prefill has more tokens than sequences"
-
-        # Kernel dispatches by (num_seqs, num_heads)
-        # This means only `num_seqs` query rows are processed
-        # For prefill, this is WRONG - we need to process `num_tokens` rows
 
 
 class TestBoundaryValidation:

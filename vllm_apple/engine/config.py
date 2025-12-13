@@ -11,6 +11,11 @@ Environment Variables:
         Enable v2.0 engine mode. When set to "1", the Metal engine takes
         over GPU execution from PyTorch-MPS. Default: "0"
 
+    VLLM_APPLE_ENGINE_PREFILL:
+        Enable running prefill/mixed steps in the engine. When disabled,
+        prefill continues to route through the PyTorch path (and may require
+        KV cache sync). Default: "0"
+
     VLLM_METAL_STRICT_NO_MPS:
         Enable strict mode that raises RuntimeError if any PyTorch-MPS
         operations are detected during the engine hot path. Useful for
@@ -50,6 +55,7 @@ logger = init_logger(__name__)
 
 # Environment variable names
 ENGINE_MODE_ENV = "VLLM_APPLE_USE_ENGINE"
+ENGINE_PREFILL_ENV = "VLLM_APPLE_ENGINE_PREFILL"
 STRICT_MODE_ENV = "VLLM_METAL_STRICT_NO_MPS"
 PROFILE_ENV = "VLLM_METAL_PROFILE"
 CAPTURE_TRACE_ENV = "VLLM_METAL_CAPTURE_NEXT_STEP"
@@ -64,6 +70,15 @@ def is_engine_mode_enabled() -> bool:
         True if VLLM_APPLE_USE_ENGINE=1
     """
     return os.environ.get(ENGINE_MODE_ENV, "0") == "1"
+
+
+def is_engine_prefill_enabled() -> bool:
+    """Check if engine prefill execution is enabled via environment variable.
+
+    Returns:
+        True if VLLM_APPLE_ENGINE_PREFILL=1
+    """
+    return os.environ.get(ENGINE_PREFILL_ENV, "0") == "1"
 
 
 def is_strict_mode_enabled() -> bool:
@@ -131,6 +146,7 @@ class EngineConfig:
 
     # Feature flags
     engine_mode: bool = False
+    engine_prefill: bool = False
     strict_mode: bool = False
     profiling: bool = False
     capture_trace: bool = False
@@ -165,6 +181,7 @@ class EngineConfig:
         """
         return cls(
             engine_mode=is_engine_mode_enabled(),
+            engine_prefill=is_engine_prefill_enabled(),
             strict_mode=is_strict_mode_enabled(),
             profiling=is_profiling_enabled(),
             capture_trace=os.environ.get(CAPTURE_TRACE_ENV, "0") == "1",
@@ -198,6 +215,7 @@ class EngineConfig:
         logger.info(
             "Engine Configuration:\n"
             f"  engine_mode: {self.engine_mode}\n"
+            f"  engine_prefill: {self.engine_prefill}\n"
             f"  strict_mode: {self.strict_mode}\n"
             f"  profiling: {self.profiling}\n"
             f"  topk_logits: {self.topk_logits}\n"

@@ -583,8 +583,8 @@ If full-logits readback becomes a bottleneck (large vocab), add **optional** mod
 |------|--------|-------|
 | 1.0 Engine mode flag | ✅ Done | `VLLM_APPLE_USE_ENGINE=1` |
 | 1.1 Engine scaffolding | ✅ Done | `MetalEngineContext`, `EngineStepContext` |
-| 1.2 KV cache single source | ⚠️ Partial | Engine owns MTLBuffer, sync from torch after prefill |
-| 1.3 Paged attention | ⚠️ Decode only | Prefill routes through PyTorch |
+| 1.2 KV cache single source | ⚠️ Partial | Engine owns MTLBuffer; torch KV still allocated for compatibility; sync only needed when prefill uses PyTorch |
+| 1.3 Paged attention | ⚠️ Partial | Decode fused; prefill/mixed via token-parallel kernel behind `VLLM_APPLE_ENGINE_PREFILL=1` |
 | 1.4 Sync policy enforcement | ✅ Done | Guards implemented |
 
 ### Phase 2-4: Model Compute (QKV, GEMM, MLP)
@@ -602,23 +602,23 @@ If full-logits readback becomes a bottleneck (large vocab), add **optional** mod
 | Item | Status | Notes |
 |------|--------|-------|
 | Step-level chaining | ✅ Done | Single command buffer per step |
-| vLLM integration | ⚠️ Partial | Decode via engine, prefill via PyTorch |
+| vLLM integration | ⚠️ Partial | Decode via engine; prefill/mixed can use engine with `VLLM_APPLE_ENGINE_PREFILL=1` (otherwise PyTorch + KV sync) |
 | E2E validation | ⏳ Pending | Need TinyLlama/Qwen2 tests |
 
 ### Known Issues Fixed (with Regression Tests)
 
 | Issue | Fix | Test |
 |-------|-----|------|
-| Prefill attention dispatch | Engine rejects prefill, routes to PyTorch | `test_step_descriptor_prefill_detection` |
+| Prefill attention dispatch | Token-parallel prefill kernel + `token_to_seq` mapping | `test_prefill_kernel_sets_token_to_seq_and_positions` |
 | GPT-2 architecture unsupported | Architecture validation added | `test_gpt2_architecture_rejected` |
 | Strict mode bypass | `ensure_cpu_tensor()` rejects MPS in engine mode | `test_mps_tensor_rejected_in_engine_mode` |
 | Scratch buffer overflow | Bounds checking added | `test_engine_config_max_batch_size` |
-| KV cache data inconsistency | `sync_from_torch_cache()` after prefill | `test_kv_cache_sync_method_exists` |
+| KV cache data inconsistency | `sync_from_torch_cache()` used only for PyTorch prefill; engine prefill avoids it | `test_kv_cache_sync_method_exists` |
 
 ### Current Limitations
 
-1. **Prefill via PyTorch**: Engine only supports decode (1 token/seq). Prefill routes through PyTorch with KV sync.
-2. **KV Cache Sync Overhead**: After prefill, KV data is copied from torch to engine MTLBuffer. Will be removed when prefill moves to engine.
+1. **Prefill Default**: Prefill/mixed steps use PyTorch by default; enable engine prefill with `VLLM_APPLE_ENGINE_PREFILL=1`.
+2. **KV Cache Duplication**: vLLM torch KV cache is still allocated for interface compatibility; KV sync is only required when PyTorch prefill is used.
 3. **Architecture Support**: Only LLaMA/Qwen2/Mistral. GPT-2 and similar are rejected.
 
 ---
@@ -631,9 +631,9 @@ If full-logits readback becomes a bottleneck (large vocab), add **optional** mod
 - [x] Engine API includes step/batch descriptor (`step_kind`, `num_scheduled_tokens`, `num_seqs_active`)
 - [~] KV cache single source of truth (engine-owned `MTLBuffer`, sync from torch after prefill)
 - [x] Step-boundary-only synchronization enforced (no per-layer/per-op waits)
-- [ ] Paged attention + KV-write executed by engine and benchmarked (batch 1/4/8/16)
+- [~] Paged attention + KV-write executed by engine (decode+prefill); benchmarks pending (batch 1/4/8/16)
 - [x] QKV / O-proj moved into engine (GEMM on `MTLBuffer`)
 - [x] RMSNorm + MLP moved into engine (full transformer block in-engine)
-- [ ] Engine-backed vLLM runner produces logits end-to-end for supported model(s)
+- [~] Engine-backed vLLM runner produces logits end-to-end (decode; prefill behind `VLLM_APPLE_ENGINE_PREFILL=1`)
 - [ ] Continuous batching validated under load (no batch-8 cliff)
 - [ ] Packaging + wheel asset tests updated for any new kernels/binaries

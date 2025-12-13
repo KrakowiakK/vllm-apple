@@ -723,6 +723,274 @@ class TestFusedWeightLayouts:
         assert down_call["C"] is output
 
 
+class TestPagedAttentionOpDispatch:
+    """Regression tests for engine attention dispatch wiring."""
+
+    def test_generic_kernel_sets_new_kv_buffers(self, monkeypatch):
+        import vllm_apple.engine.ops.attention as attn_mod
+
+        # Allow testing without Metal bindings by stubbing MTLSize.
+        monkeypatch.setattr(attn_mod, "MTLSize", lambda x, y, z: (x, y, z))
+
+        class DummyContext:
+            def compile_library(self, *args, **kwargs):
+                return None
+
+            def get_pipeline(self, library_name, function_name, function_constants=None):
+                return f"pipeline:{function_name}"
+
+            def create_buffer_from_bytes(self, data: bytes):
+                return object()
+
+        class Encoder:
+            def __init__(self):
+                self.calls: list[tuple] = []
+
+            def setComputePipelineState_(self, pipeline):
+                self.calls.append(("pipeline", pipeline))
+
+            def setBuffer_offset_atIndex_(self, buf, offset, index):
+                self.calls.append(("buffer", index, buf, offset))
+
+            def dispatchThreadgroups_threadsPerThreadgroup_(self, threadgroups, threads_per_group):
+                self.calls.append(("dispatch", threadgroups, threads_per_group))
+
+        class StepCtx:
+            is_encoding = True
+
+            def __init__(self):
+                self.encoder = Encoder()
+                self.barriers = 0
+
+            def get_compute_encoder(self):
+                return self.encoder
+
+            def memory_barrier(self):
+                self.barriers += 1
+
+        ctx = DummyContext()
+        attn = attn_mod.PagedAttentionOp(
+            context=ctx,
+            num_kv_heads=2,
+            num_query_heads=4,
+            head_size=64,
+            block_size=16,
+        )
+        assert attn._kernel_name == "paged_attention_fused_generic"
+
+        step_ctx = StepCtx()
+
+        attn.encode_decode_fused(
+            step_ctx=step_ctx,
+            query_buffer="Q",
+            new_keys_buffer="NEWK",
+            new_values_buffer="NEWV",
+            key_buffer="KC",
+            value_buffer="VC",
+            block_table_buffer="BT",
+            seq_lens_buffer="SL",
+            output_buffer="OUT",
+            num_seqs=3,
+            max_seq_len=32,
+            max_blocks_per_seq=4,
+            query_offset=10,
+            new_keys_offset=20,
+            new_values_offset=30,
+            output_offset=40,
+        )
+
+        assert step_ctx.barriers == 0
+
+        buffers = [c for c in step_ctx.encoder.calls if c[0] == "buffer"]
+        buffers_by_index = {idx: (buf, off) for _, idx, buf, off in buffers}
+
+        # Generic fused kernel must bind new K/V at buffer(7) and buffer(8).
+        assert buffers_by_index[0] == ("Q", 10)
+        assert buffers_by_index[5] == ("OUT", 40)
+        assert buffers_by_index[7] == ("NEWK", 20)
+        assert buffers_by_index[8] == ("NEWV", 30)
+
+        dispatches = [c for c in step_ctx.encoder.calls if c[0] == "dispatch"]
+        assert len(dispatches) == 1
+        _, threadgroups, threads = dispatches[0]
+        assert threadgroups == (3, 4, 1)
+        assert threads == (32, 1, 1)
+
+    def test_h128_path_dispatches_kv_write_then_attention(self, monkeypatch):
+        import vllm_apple.engine.ops.attention as attn_mod
+
+        monkeypatch.setattr(attn_mod, "MTLSize", lambda x, y, z: (x, y, z))
+
+        class DummyContext:
+            def compile_library(self, *args, **kwargs):
+                return None
+
+            def get_pipeline(self, library_name, function_name, function_constants=None):
+                return f"pipeline:{function_name}"
+
+            def create_buffer_from_bytes(self, data: bytes):
+                return object()
+
+        class Encoder:
+            def __init__(self):
+                self.calls: list[tuple] = []
+
+            def setComputePipelineState_(self, pipeline):
+                self.calls.append(("pipeline", pipeline))
+
+            def setBuffer_offset_atIndex_(self, buf, offset, index):
+                self.calls.append(("buffer", index, buf, offset))
+
+            def dispatchThreadgroups_threadsPerThreadgroup_(self, threadgroups, threads_per_group):
+                self.calls.append(("dispatch", threadgroups, threads_per_group))
+
+        class StepCtx:
+            is_encoding = True
+
+            def __init__(self):
+                self.encoder = Encoder()
+                self.barriers = 0
+
+            def get_compute_encoder(self):
+                return self.encoder
+
+            def memory_barrier(self):
+                self.barriers += 1
+
+        ctx = DummyContext()
+        attn = attn_mod.PagedAttentionOp(
+            context=ctx,
+            num_kv_heads=2,
+            num_query_heads=4,
+            head_size=128,
+            block_size=16,
+        )
+        assert attn._kernel_name == "paged_attention_fused_h128"
+
+        step_ctx = StepCtx()
+
+        attn.encode_decode_fused(
+            step_ctx=step_ctx,
+            query_buffer="Q",
+            new_keys_buffer="NEWK",
+            new_values_buffer="NEWV",
+            key_buffer="KC",
+            value_buffer="VC",
+            block_table_buffer="BT",
+            seq_lens_buffer="SL",
+            output_buffer="OUT",
+            num_seqs=3,
+            max_seq_len=32,
+            max_blocks_per_seq=4,
+            query_offset=10,
+            new_keys_offset=20,
+            new_values_offset=30,
+            output_offset=40,
+        )
+
+        assert step_ctx.barriers == 1
+
+        pipelines = [c for c in step_ctx.encoder.calls if c[0] == "pipeline"]
+        assert pipelines[0][1] == "pipeline:kv_write_decode"
+        assert pipelines[1][1] == "pipeline:paged_attention_fused_h128"
+
+        dispatches = [c for c in step_ctx.encoder.calls if c[0] == "dispatch"]
+        assert len(dispatches) == 2
+        _, kv_tg, kv_threads = dispatches[0]
+        _, attn_tg, attn_threads = dispatches[1]
+
+        assert kv_tg == (3, 2, 1)
+        assert kv_threads == (32, 1, 1)
+        assert attn_tg == (3, 4, 1)
+        assert attn_threads == (32, 1, 1)
+
+    def test_prefill_kernel_sets_token_to_seq_and_positions(self, monkeypatch):
+        import vllm_apple.engine.ops.attention as attn_mod
+
+        monkeypatch.setattr(attn_mod, "MTLSize", lambda x, y, z: (x, y, z))
+
+        class DummyContext:
+            def compile_library(self, *args, **kwargs):
+                return None
+
+            def get_pipeline(self, library_name, function_name, function_constants=None):
+                return f"pipeline:{function_name}"
+
+            def create_buffer_from_bytes(self, data: bytes):
+                return object()
+
+        class Encoder:
+            def __init__(self):
+                self.calls: list[tuple] = []
+
+            def setComputePipelineState_(self, pipeline):
+                self.calls.append(("pipeline", pipeline))
+
+            def setBuffer_offset_atIndex_(self, buf, offset, index):
+                self.calls.append(("buffer", index, buf, offset))
+
+            def dispatchThreadgroups_threadsPerThreadgroup_(self, threadgroups, threads_per_group):
+                self.calls.append(("dispatch", threadgroups, threads_per_group))
+
+        class StepCtx:
+            is_encoding = True
+
+            def __init__(self):
+                self.encoder = Encoder()
+                self.barriers = 0
+
+            def get_compute_encoder(self):
+                return self.encoder
+
+            def memory_barrier(self):
+                self.barriers += 1
+
+        ctx = DummyContext()
+        attn = attn_mod.PagedAttentionOp(
+            context=ctx,
+            num_kv_heads=2,
+            num_query_heads=4,
+            head_size=64,
+            block_size=16,
+        )
+
+        step_ctx = StepCtx()
+
+        attn.encode_prefill(
+            step_ctx=step_ctx,
+            query_buffer="Q",
+            key_buffer="KC",
+            value_buffer="VC",
+            block_table_buffer="BT",
+            token_to_seq_buffer="T2S",
+            positions_buffer="POS",
+            output_buffer="OUT",
+            num_tokens=5,
+            num_seqs=2,
+            max_seq_len=32,
+            max_blocks_per_seq=4,
+            query_offset=11,
+            output_offset=22,
+        )
+
+        assert step_ctx.barriers == 0
+
+        buffers = [c for c in step_ctx.encoder.calls if c[0] == "buffer"]
+        buffers_by_index = {idx: (buf, off) for _, idx, buf, off in buffers}
+
+        assert buffers_by_index[0] == ("Q", 11)
+        assert buffers_by_index[4] == ("T2S", 0)
+        assert buffers_by_index[5] == ("POS", 0)
+        assert buffers_by_index[6] == ("OUT", 22)
+        assert buffers_by_index[7][1] == 0  # params buffer
+
+        dispatches = [c for c in step_ctx.encoder.calls if c[0] == "dispatch"]
+        assert len(dispatches) == 1
+        _, threadgroups, threads = dispatches[0]
+        assert threadgroups == (5, 4, 1)
+        assert threads == (32, 1, 1)
+
+
 class TestAttentionBackendKVCacheDevice:
     """Regression tests for KV-cache device selection."""
 

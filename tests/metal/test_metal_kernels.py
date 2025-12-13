@@ -377,6 +377,66 @@ class TestGenericKernel:
         # V1.5: h64 removed, should use generic
         assert kernel.kernel_name == "paged_attention_fused_generic"
 
+    def test_generic_kernel_compute_single_token(self):
+        """Generic fused kernel should write KV and attend correctly (seq_len=1).
+
+        For a single-token sequence, attention reduces to selecting that token's
+        value vector, repeated across query heads per GQA mapping.
+        """
+        from vllm_apple.metal.kv_cache import MetalKVCache
+        from vllm_apple.metal.bridge.metal_paged_attention_fused import (
+            MetalPagedAttentionFused,
+        )
+
+        head_size = 64
+        num_seqs = 1
+        num_kv_heads = 4
+        num_query_heads = 32
+        block_size = 16
+
+        kv_cache = MetalKVCache(
+            num_blocks=8,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            head_size=head_size,
+            num_layers=1,
+        )
+
+        kernel = MetalPagedAttentionFused(
+            num_kv_heads=num_kv_heads,
+            num_query_heads=num_query_heads,
+            head_size=head_size,
+            block_size=block_size,
+        )
+        assert kernel.kernel_name == "paged_attention_fused_generic"
+
+        query = torch.randn(num_seqs, num_query_heads, head_size, dtype=torch.float16)
+        new_keys = torch.randn(num_seqs, num_kv_heads, head_size, dtype=torch.float16)
+        new_values = torch.randn(num_seqs, num_kv_heads, head_size, dtype=torch.float16)
+        output = torch.empty_like(query)
+
+        # Single token lives in block 0 at offset 0.
+        block_table = torch.zeros(num_seqs, 1, dtype=torch.int32)
+        seq_lens = torch.tensor([1], dtype=torch.int32)
+
+        key_buffer, value_buffer = kv_cache.get_buffers(0)
+
+        kernel.forward_fused(
+            query=query,
+            new_keys=new_keys,
+            new_values=new_values,
+            key_buffer=key_buffer,
+            value_buffer=value_buffer,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            output=output,
+        )
+
+        queries_per_kv = num_query_heads // num_kv_heads
+        expected = new_values.repeat_interleave(queries_per_kv, dim=1)
+        assert output.shape == expected.shape
+        assert torch.allclose(output, expected, atol=0, rtol=0)
+
 
 # ============================================================================
 # Metal Availability Tests

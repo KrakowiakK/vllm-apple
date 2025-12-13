@@ -11,8 +11,10 @@ Legend: `[x]` done, `[ ]` not yet, `[~]` partial/temporary.
 
 Current status (engine mode):
 - Decode path uses `EngineRunner` (MTLBuffer engine).
-- Prefill routes through PyTorch and then syncs KV to engine (temporary; violates “single source of truth”).
-- Decode inputs are currently prepared on MPS and converted MPS→CPU at the boundary (`allow_mps_conversion=True`), and KV sync calls `torch.mps.synchronize()` (not plan-compliant).
+- Prefill routes through PyTorch and then syncs KV to engine by default (temporary; violates “single source of truth”).
+- Prefill/mixed steps can run in-engine with `VLLM_APPLE_ENGINE_PREFILL=1` (avoids KV sync).
+- Decode inputs are prepared on CPU in engine mode (no implicit MPS→CPU boundary conversion).
+- KV sync calls `torch.mps.synchronize()` only when PyTorch prefill is used (not plan-compliant; engine prefill avoids it).
 
 ---
 

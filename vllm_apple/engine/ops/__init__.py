@@ -26,7 +26,8 @@ Usage:
     attn_op = PagedAttentionOp(context, num_kv_heads=32, ...)
 
     # Encode to command buffer (no wait)
-    attn_op.encode(step_ctx, query, kv_cache, block_table, output)
+    attn_op.encode_decode_fused(...)  # decode
+    attn_op.encode_prefill(...)       # prefill/mixed
 """
 
 # Lazy imports to avoid loading all ops when only some are needed

@@ -346,8 +346,9 @@ class EngineRunner:
         5. Submits and waits
         6. Returns logits on CPU
 
-        IMPORTANT: Currently only supports decode steps (num_tokens == num_seqs).
-        Prefill steps with num_tokens > num_seqs must be routed through PyTorch path.
+        Supports both:
+        - Decode steps (typically 1 token per sequence) using fused KV-write+attention
+        - Prefill/mixed steps (num_tokens may exceed num_seqs) using token-parallel attention
 
         Args:
             step_desc: Step descriptor with metadata
@@ -356,26 +357,13 @@ class EngineRunner:
         Returns:
             EngineOutputs with logits on CPU
 
-        Raises:
-            ValueError: If prefill step is passed (engine is decode-only for now)
         """
         self._step_counter += 1
         num_tokens = step_desc.num_scheduled_tokens
         num_seqs = step_desc.num_seqs_active
 
-        # CRITICAL: Engine attention kernel only supports decode (1 token per seq).
-        # Prefill requires token-parallel attention which is not yet implemented.
-        # Route prefill through PyTorch path in AppleModelRunner._execute_forward().
-        if step_desc.is_prefill:
-            raise ValueError(
-                f"EngineRunner only supports decode steps. "
-                f"Prefill (num_tokens={num_tokens}, num_seqs={num_seqs}) must use PyTorch path. "
-                f"This is a correctness requirement: the attention kernel dispatches by "
-                f"(num_seqs, num_heads), not (num_tokens, num_heads)."
-            )
-
         # Sanity check for decode: should have exactly 1 token per sequence
-        if num_tokens != num_seqs and num_tokens > 0:
+        if step_desc.is_decode and num_tokens != num_seqs and num_tokens > 0:
             logger.warning(
                 f"Decode step has num_tokens={num_tokens} != num_seqs={num_seqs}. "
                 f"This may indicate mixed prefill/decode which is not fully supported."
@@ -451,6 +439,45 @@ class EngineRunner:
                 context=f"step {self._step_counter} prefill"
             )
 
+        # Prefill/mixed steps need a token→sequence mapping to interpret the flattened
+        # query batch. Build it once on CPU and upload as an int32 MTLBuffer.
+        token_to_seq_buffer = None
+        if step_desc.is_prefill:
+            if inputs.query_start_locs is None:
+                raise ValueError(
+                    "Prefill step requires EngineInputs.query_start_locs "
+                    "(cumulative start offsets, length num_seqs_active + 1)."
+                )
+
+            qsl = inputs.query_start_locs.to(torch.int32)
+            if qsl.numel() != num_seqs + 1:
+                raise ValueError(
+                    f"query_start_locs has {qsl.numel()} elements, expected {num_seqs + 1} "
+                    f"(num_seqs_active={num_seqs})."
+                )
+            if int(qsl[0].item()) != 0:
+                raise ValueError(f"query_start_locs[0] must be 0, got {int(qsl[0].item())}")
+            if int(qsl[-1].item()) != num_tokens:
+                raise ValueError(
+                    f"query_start_locs[-1] must equal num_tokens ({num_tokens}), "
+                    f"got {int(qsl[-1].item())}."
+                )
+
+            lens = (qsl[1:] - qsl[:-1]).to(torch.int64)
+            if (lens < 0).any():
+                raise ValueError("query_start_locs must be non-decreasing (negative query length found).")
+
+            token_to_seq = torch.repeat_interleave(
+                torch.arange(num_seqs, dtype=torch.int32),
+                lens,
+            )
+            if token_to_seq.numel() != num_tokens:
+                raise ValueError(
+                    f"token_to_seq has {token_to_seq.numel()} elements, expected num_tokens={num_tokens}. "
+                    f"This indicates inconsistent query_start_locs."
+                )
+            token_to_seq_buffer = self._copy_to_buffer(token_to_seq, "token_to_seq")
+
         # Create step context
         with EngineStepContext(
             engine_context=self._context,
@@ -489,6 +516,7 @@ class EngineRunner:
                     block_table_buffer=block_table_buffer,
                     slot_mapping_buffer=slot_mapping_buffer,
                     seq_lens_buffer=seq_lens_buffer,
+                    token_to_seq_buffer=token_to_seq_buffer,
                     num_tokens=num_tokens,
                     num_seqs=step_desc.num_seqs_active,
                     step_desc=step_desc,
@@ -538,6 +566,7 @@ class EngineRunner:
         block_table_buffer: Any,
         slot_mapping_buffer: Any,
         seq_lens_buffer: Any,
+        token_to_seq_buffer: Any,
         num_tokens: int,
         num_seqs: int,
         step_desc: StepDescriptor,
@@ -631,75 +660,69 @@ class EngineRunner:
 
         step_ctx.memory_barrier()
 
-        # 4. Write K, V to cache
+        # 4. Attention (decode-only): fused KV-write + attention
         # Get KV cache buffers for this layer
         k_cache, v_cache = self._kv_cache.get_buffers(layer_idx)
 
-        # Create EngineTensor views for new K and V
-        new_k_tensor = EngineTensor(
-            buffer=qkv_buffer,
-            shape=(num_tokens, md.num_kv_heads, md.head_size),
-            dtype=EngineDType.FLOAT16,
-            offset=k_offset_bytes,
-        )
-        new_v_tensor = EngineTensor(
-            buffer=qkv_buffer,
-            shape=(num_tokens, md.num_kv_heads, md.head_size),
-            dtype=EngineDType.FLOAT16,
-            offset=v_offset_bytes,
-        )
+        if step_desc.is_prefill:
+            if token_to_seq_buffer is None:
+                raise RuntimeError("token_to_seq_buffer is required for prefill attention")
 
-        if step_desc.is_decode:
-            # Decode: single token per sequence
-            # max_blocks_per_seq computed earlier from actual block_table shape
-            layer_ops.kv_write.encode_decode(
-                step_ctx=step_ctx,
-                new_keys_buffer=new_k_tensor.buffer,
-                new_values_buffer=new_v_tensor.buffer,
-                key_buffer=k_cache,
-                value_buffer=v_cache,
-                block_table_buffer=block_table_buffer,
-                seq_lens_buffer=seq_lens_buffer,
-                num_seqs=num_seqs,
-                new_keys_offset=new_k_tensor.offset,
-                new_values_offset=new_v_tensor.offset,
-                max_blocks_per_seq=max_blocks_per_seq,
-            )
-        else:
-            # Prefill: multiple tokens
+            # Prefill/mixed: write K/V for every token, then run token-parallel attention.
             layer_ops.kv_write.encode_prefill(
                 step_ctx=step_ctx,
-                new_keys_buffer=new_k_tensor.buffer,
-                new_values_buffer=new_v_tensor.buffer,
+                new_keys_buffer=qkv_buffer,
+                new_values_buffer=qkv_buffer,
                 key_buffer=k_cache,
                 value_buffer=v_cache,
                 slot_mapping_buffer=slot_mapping_buffer,
                 num_tokens=num_tokens,
-                new_keys_offset=new_k_tensor.offset,
-                new_values_offset=new_v_tensor.offset,
+                new_keys_offset=k_offset_bytes,
+                new_values_offset=v_offset_bytes,
+            )
+
+            step_ctx.memory_barrier()
+
+            layer_ops.attention.encode_prefill(
+                step_ctx=step_ctx,
+                query_buffer=qkv_buffer,
+                key_buffer=k_cache,
+                value_buffer=v_cache,
+                block_table_buffer=block_table_buffer,
+                token_to_seq_buffer=token_to_seq_buffer,
+                positions_buffer=positions_buffer,
+                output_buffer=attn_output_buffer,
+                num_tokens=num_tokens,
+                num_seqs=num_seqs,
+                max_seq_len=max_seq_len,
+                max_blocks_per_seq=max_blocks_per_seq,
+                query_offset=0,
+                output_offset=0,
+            )
+        else:
+            # Decode: fused KV-write + attention.
+            layer_ops.attention.encode_decode_fused(
+                step_ctx=step_ctx,
+                query_buffer=qkv_buffer,  # Q is at start
+                new_keys_buffer=qkv_buffer,
+                new_values_buffer=qkv_buffer,
+                key_buffer=k_cache,
+                value_buffer=v_cache,
+                block_table_buffer=block_table_buffer,
+                seq_lens_buffer=seq_lens_buffer,
+                output_buffer=attn_output_buffer,
+                num_seqs=num_seqs,
+                max_seq_len=max_seq_len,
+                max_blocks_per_seq=max_blocks_per_seq,
+                query_offset=0,
+                new_keys_offset=k_offset_bytes,
+                new_values_offset=v_offset_bytes,
+                output_offset=0,
             )
 
         step_ctx.memory_barrier()
 
-        # 5. Attention
-        # max_seq_len is passed from execute_step (computed on CPU from seq_lens)
-
-        layer_ops.attention.encode(
-            step_ctx=step_ctx,
-            query_buffer=qkv_buffer,
-            key_buffer=k_cache,
-            value_buffer=v_cache,
-            block_table_buffer=block_table_buffer,
-            seq_lens_buffer=seq_lens_buffer,
-            output_buffer=attn_output_buffer,
-            num_seqs=num_seqs,
-            max_seq_len=max_seq_len,
-            max_blocks_per_seq=max_blocks_per_seq,  # Computed from actual block_table shape
-        )
-
-        step_ctx.memory_barrier()
-
-        # 6. O Projection + residual add
+        # 5. O Projection + residual add
         layer_ops.o_proj.encode(
             step_ctx=step_ctx,
             attn_output=attn_output_buffer,
