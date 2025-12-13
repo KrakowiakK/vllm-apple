@@ -259,56 +259,69 @@ class EngineMLP:
         Computes: down_proj(silu(gate_proj(x)) * up_proj(x))
 
         Supports both:
-        - Fused gate_up_proj weights (single GEMM, split output)
+        - Fused gate_up_proj weights (two GEMMs via weight slicing)
         - Separate gate_proj + up_proj weights (two GEMMs)
         """
         H = self.config.hidden_size
         I = self.config.intermediate_size
 
         if self._fused_gate_up:
-            # Fused gate-up projection: single GEMM with 2*I output
-            # [num_tokens, H] @ [2*I, H]^T -> [num_tokens, 2*I]
-            # Output layout: [gate_output | up_output] = [num_tokens, 2*I]
+            # Fused gate-up projection weights.
+            #
+            # IMPORTANT: A single GEMM producing [num_tokens, 2*I] yields per-token
+            # row-interleaved layout (gate|up for each token). Downstream elementwise
+            # ops assume gate and up are each contiguous across all tokens.
+            if self._gate_up_proj is None:
+                raise RuntimeError("Fused gate_up_proj weights not set - call set_weights(gate_up_proj=...) first")
 
-            # Allocate buffer for combined gate+up output
-            gate_up_size_bytes = num_tokens * 2 * I * 2  # float16
-            gate_up_combined = step_ctx.allocate_scratch(gate_up_size_bytes)
+            element_size = 2  # float16
+            weight_row_bytes = H * element_size
 
-            self._gemm.encode(
-                step_ctx=step_ctx,
-                A=hidden_states,
-                B=self._gate_up_proj,
-                C=gate_up_combined,
-                M=num_tokens,
-                K=H,
-                N=2 * I,
-                transpose_B=True,  # Weight is [2*I, H]
-            )
-
-            # Memory barrier after GEMM
-            step_ctx.memory_barrier()
-
-            # Split the output and apply silu_mul
-            # gate is at offset 0, up is at offset I*2 (bytes per element = 2 for float16)
-            gate_tensor = EngineTensor(
-                buffer=gate_up_combined,
-                shape=(num_tokens, I),
+            gate_weight = EngineTensor(
+                buffer=self._gate_up_proj,
+                shape=(I, H),
                 dtype=EngineDType.FLOAT16,
                 offset=0,
             )
-            up_tensor = EngineTensor(
-                buffer=gate_up_combined,
-                shape=(num_tokens, I),
+            up_weight = EngineTensor(
+                buffer=self._gate_up_proj,
+                shape=(I, H),
                 dtype=EngineDType.FLOAT16,
-                offset=num_tokens * I * 2,  # After gate values
+                offset=I * weight_row_bytes,
             )
+
+            # gate_proj(x) -> gate_intermediate
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=gate_weight,
+                C=gate_intermediate,
+                M=num_tokens,
+                K=H,
+                N=I,
+                transpose_B=True,
+            )
+
+            # up_proj(x) -> up_intermediate
+            self._gemm.encode(
+                step_ctx=step_ctx,
+                A=hidden_states,
+                B=up_weight,
+                C=up_intermediate,
+                M=num_tokens,
+                K=H,
+                N=I,
+                transpose_B=True,
+            )
+
+            step_ctx.memory_barrier()
 
             # silu(gate) * up -> fused_intermediate
             num_intermediate_elements = num_tokens * I
             self._elementwise.encode_silu_mul(
                 step_ctx=step_ctx,
-                gate=gate_tensor,
-                up=up_tensor,
+                gate=gate_intermediate,
+                up=up_intermediate,
                 output=fused_intermediate,
                 num_elements=num_intermediate_elements,
             )

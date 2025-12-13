@@ -544,3 +544,116 @@ class TestValidationError:
         assert "CPU" in error.message
         assert error.actual_value == "mps:0"
         assert error.expected_value == "cpu"
+
+
+class TestStrictModeActivation:
+    """Tests for strict mode activation flow (simulating worker startup).
+
+    These tests verify that strict mode is properly activated when
+    enable_strict_mode() is called, matching the behavior expected
+    when AppleWorker.init_device() runs with VLLM_METAL_STRICT_NO_MPS=1.
+    """
+
+    def setup_method(self):
+        """Ensure clean state before each test."""
+        disable_strict_mode()
+        if "VLLM_METAL_STRICT_NO_MPS" in os.environ:
+            del os.environ["VLLM_METAL_STRICT_NO_MPS"]
+        EngineHotPathGuard.set_phase(EnginePhase.IDLE)
+
+    def teardown_method(self):
+        """Clean up after each test."""
+        disable_strict_mode()
+        if "VLLM_METAL_STRICT_NO_MPS" in os.environ:
+            del os.environ["VLLM_METAL_STRICT_NO_MPS"]
+        EngineHotPathGuard.set_phase(EnginePhase.IDLE)
+
+    def test_strict_mode_activation_idempotent(self):
+        """enable_strict_mode() should be safe to call multiple times."""
+        os.environ["VLLM_METAL_STRICT_NO_MPS"] = "1"
+
+        # Call multiple times (as might happen in tests or reinitialization)
+        enable_strict_mode()
+        assert get_strict_mode_enabled()
+
+        enable_strict_mode()
+        assert get_strict_mode_enabled()
+
+        enable_strict_mode()
+        assert get_strict_mode_enabled()
+
+    def test_strict_mode_activation_sets_patches(self):
+        """enable_strict_mode() should apply monkey-patches when env var set."""
+        os.environ["VLLM_METAL_STRICT_NO_MPS"] = "1"
+
+        # Before activation - get_strict_mode_enabled should be False
+        assert not get_strict_mode_enabled()
+
+        # Activate
+        enable_strict_mode()
+
+        # After activation - patches should be in place
+        assert get_strict_mode_enabled()
+
+    @pytest.mark.skipif(
+        not hasattr(torch, 'mps') or not hasattr(torch.mps, 'synchronize'),
+        reason="torch.mps.synchronize not available"
+    )
+    def test_patches_functional_after_activation(self):
+        """Patches should be functional after enable_strict_mode()."""
+        os.environ["VLLM_METAL_STRICT_NO_MPS"] = "1"
+        enable_strict_mode()
+
+        # In hot path, torch.mps.synchronize should raise
+        with EngineHotPathGuard.encode_phase():
+            with pytest.raises(RuntimeError, match="torch.mps.synchronize"):
+                torch.mps.synchronize()
+
+        # Outside hot path, should not raise our error
+        EngineHotPathGuard.set_phase(EnginePhase.IDLE)
+        try:
+            torch.mps.synchronize()
+        except RuntimeError as e:
+            # MPS may not be available, but should not be our forbidden op error
+            assert "Forbidden operation" not in str(e)
+
+    def test_strict_mode_deactivation_removes_patches(self):
+        """disable_strict_mode() should restore original behavior."""
+        os.environ["VLLM_METAL_STRICT_NO_MPS"] = "1"
+        enable_strict_mode()
+        assert get_strict_mode_enabled()
+
+        disable_strict_mode()
+        assert not get_strict_mode_enabled()
+
+    def test_env_var_checked_at_enable_time(self):
+        """enable_strict_mode() should check env var at call time."""
+        # First call without env var - should not enable
+        enable_strict_mode()
+        assert not get_strict_mode_enabled()
+
+        # Now set env var and call again
+        os.environ["VLLM_METAL_STRICT_NO_MPS"] = "1"
+        enable_strict_mode()
+        assert get_strict_mode_enabled()
+
+    def test_strict_mode_with_phase_transitions(self):
+        """Strict mode should work correctly through phase transitions."""
+        os.environ["VLLM_METAL_STRICT_NO_MPS"] = "1"
+        enable_strict_mode()
+
+        # Simulate a full step execution
+        with EngineHotPathGuard.step_execution() as step:
+            # ENCODE phase - should be hot path
+            assert EngineHotPathGuard.is_hot_path()
+
+            # Transition to SUBMIT - still hot path
+            step.transition_to_submit()
+            assert EngineHotPathGuard.is_hot_path()
+
+            # Transition to READBACK - no longer hot path
+            step.transition_to_readback()
+            assert not EngineHotPathGuard.is_hot_path()
+
+        # After step - should be IDLE
+        assert EngineHotPathGuard.get_phase() == EnginePhase.IDLE

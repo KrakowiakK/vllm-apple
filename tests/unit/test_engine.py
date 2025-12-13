@@ -517,6 +517,221 @@ class TestMaxSeqLenCalculation:
         assert max_seq_len == 0
 
 
+class TestFusedWeightLayouts:
+    """Regression tests for fused-weight buffer layouts.
+
+    These tests validate encode-time buffer slicing and offsets without requiring
+    Metal/MPS runtime availability.
+    """
+
+    def test_qkv_fused_multi_token_writes_stacked_layout(self, monkeypatch):
+        import vllm_apple.engine.ops.qkv as qkv_mod
+        from vllm_apple.engine.tensor import EngineTensor
+
+        gemm_calls: list[dict] = []
+
+        class StubGEMM:
+
+            def __init__(self, context):
+                pass
+
+            def encode(self, **kwargs):
+                gemm_calls.append(kwargs)
+
+        monkeypatch.setattr(qkv_mod, "EngineGEMM", StubGEMM)
+
+        class DummyBuffer:
+
+            def __init__(self, nbytes: int):
+                self._nbytes = nbytes
+
+            def length(self) -> int:
+                return self._nbytes
+
+        class StepCtx:
+            is_encoding = True
+
+            def memory_barrier(self) -> None:
+                pass
+
+        hidden_size = 16
+        num_heads = 2
+        num_kv_heads = 1
+        head_size = 4
+        num_tokens = 2
+
+        q_size = num_heads * head_size
+        k_size = num_kv_heads * head_size
+        v_size = num_kv_heads * head_size
+        qkv_size = q_size + k_size + v_size
+
+        proj = qkv_mod.EngineQKVProjection(
+            context=object(),
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            fused=True,
+        )
+
+        weight = DummyBuffer(qkv_size * hidden_size * 2)
+        proj.set_weights(qkv_weight=weight)
+
+        hidden_states = DummyBuffer(num_tokens * hidden_size * 2)
+        qkv_output = DummyBuffer(num_tokens * qkv_size * 2)
+
+        q_info, k_info, v_info = proj.encode(
+            step_ctx=StepCtx(),
+            hidden_states=hidden_states,
+            qkv_output=qkv_output,
+            num_tokens=num_tokens,
+        )
+
+        assert len(gemm_calls) == 3
+        q_call, k_call, v_call = gemm_calls
+
+        # Output slices are stacked by projection (Q then K then V).
+        assert isinstance(q_call["C"], EngineTensor)
+        assert isinstance(k_call["C"], EngineTensor)
+        assert isinstance(v_call["C"], EngineTensor)
+
+        assert q_call["C"].offset == 0
+        assert k_call["C"].offset == num_tokens * q_size * 2
+        assert v_call["C"].offset == num_tokens * (q_size + k_size) * 2
+
+        assert q_call["N"] == q_size
+        assert k_call["N"] == k_size
+        assert v_call["N"] == v_size
+        assert q_call["transpose_B"] is True
+        assert k_call["transpose_B"] is True
+        assert v_call["transpose_B"] is True
+
+        # Fused weight buffer is sliced by rows: [q][k][v].
+        assert isinstance(q_call["B"], EngineTensor)
+        assert isinstance(k_call["B"], EngineTensor)
+        assert isinstance(v_call["B"], EngineTensor)
+
+        assert q_call["B"].offset == 0
+        assert k_call["B"].offset == q_size * hidden_size * 2
+        assert v_call["B"].offset == (q_size + k_size) * hidden_size * 2
+
+        # Returned offsets match the stacked layout contract.
+        assert q_info["offset"] == 0
+        assert k_info["offset"] == num_tokens * q_size * 2
+        assert v_info["offset"] == num_tokens * (q_size + k_size) * 2
+
+    def test_mlp_fused_gate_up_slices_weights(self, monkeypatch):
+        import vllm_apple.engine.ops.mlp as mlp_mod
+        from vllm_apple.engine.tensor import EngineTensor
+
+        gemm_calls: list[dict] = []
+        silu_mul_calls: list[dict] = []
+
+        class StubGEMM:
+
+            def __init__(self, context):
+                pass
+
+            def encode(self, **kwargs):
+                gemm_calls.append(kwargs)
+
+        class StubElementwiseOps:
+
+            def __init__(self, context):
+                pass
+
+            def encode_silu_mul(self, **kwargs):
+                silu_mul_calls.append(kwargs)
+
+        monkeypatch.setattr(mlp_mod, "EngineGEMM", StubGEMM)
+        monkeypatch.setattr(mlp_mod, "EngineElementwiseOps", StubElementwiseOps)
+
+        class DummyBuffer:
+
+            def __init__(self, nbytes: int):
+                self._nbytes = nbytes
+
+            def length(self) -> int:
+                return self._nbytes
+
+        class StepCtx:
+            is_encoding = True
+
+            def __init__(self):
+                self.allocs: list[DummyBuffer] = []
+
+            def allocate_scratch(self, size: int):
+                buf = DummyBuffer(size)
+                self.allocs.append(buf)
+                return buf
+
+            def memory_barrier(self) -> None:
+                pass
+
+        hidden_size = 16
+        intermediate_size = 8
+        num_tokens = 3
+
+        gate_up_weight = DummyBuffer(2 * intermediate_size * hidden_size * 2)
+        down_weight = DummyBuffer(hidden_size * intermediate_size * 2)
+
+        mlp = mlp_mod.EngineMLP(
+            context=object(),
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            gated=True,
+            activation="silu",
+        )
+        mlp.set_weights(gate_up_proj=gate_up_weight, down_proj=down_weight)
+
+        step_ctx = StepCtx()
+        hidden_states = DummyBuffer(num_tokens * hidden_size * 2)
+        output = DummyBuffer(num_tokens * hidden_size * 2)
+
+        mlp.encode(
+            step_ctx=step_ctx,
+            hidden_states=hidden_states,
+            output_buffer=output,
+            num_tokens=num_tokens,
+        )
+
+        # gate, up, down
+        assert len(gemm_calls) == 3
+        gate_call, up_call, down_call = gemm_calls
+
+        assert gate_call["N"] == intermediate_size
+        assert up_call["N"] == intermediate_size
+        assert gate_call["transpose_B"] is True
+        assert up_call["transpose_B"] is True
+
+        assert isinstance(gate_call["B"], EngineTensor)
+        assert isinstance(up_call["B"], EngineTensor)
+        assert gate_call["B"].offset == 0
+        assert up_call["B"].offset == intermediate_size * hidden_size * 2
+
+        gate_intermediate, up_intermediate, fused_intermediate = step_ctx.allocs
+        assert gate_call["C"] is gate_intermediate
+        assert up_call["C"] is up_intermediate
+
+        assert len(silu_mul_calls) == 1
+        assert silu_mul_calls[0]["gate"] is gate_intermediate
+        assert silu_mul_calls[0]["up"] is up_intermediate
+        assert silu_mul_calls[0]["output"] is fused_intermediate
+
+        assert down_call["A"] is fused_intermediate
+        assert down_call["B"] is down_weight
+        assert down_call["C"] is output
+
+
+class TestAttentionBackendKVCacheDevice:
+    """Regression tests for KV-cache device selection."""
+
+    def test_mps_backend_allocates_kv_cache_on_mps(self):
+        from vllm_apple.v1.attention.backends.mps_attn import MPSAttentionBackend
+
+        assert MPSAttentionBackend.get_kv_cache_device() == "mps"
+
+
 # Run tests with pytest
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -33,7 +33,7 @@ import time
 
 from vllm.logger import init_logger
 from .guards import EngineHotPathGuard, EnginePhase
-from .profiling import get_profiler, PROFILING_ENABLED
+from .profiling import get_profiler, is_profiling_enabled
 
 logger = init_logger(__name__)
 
@@ -109,7 +109,7 @@ class EngineStepContext:
         self._current_phase = EnginePhase.IDLE
 
         # Profiling
-        self._profiler = get_profiler() if PROFILING_ENABLED else None
+        self._profiler = get_profiler() if is_profiling_enabled() else None
 
     def __enter__(self) -> "EngineStepContext":
         """Enter step context - starts ENCODE phase."""

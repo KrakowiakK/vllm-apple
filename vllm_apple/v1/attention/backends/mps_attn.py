@@ -82,6 +82,15 @@ class MPSAttentionBackend(BaseAppleAttentionBackend):
     def get_builder_cls() -> type["MPSAttentionMetadataBuilder"]:
         return MPSAttentionMetadataBuilder
 
+    @staticmethod
+    def get_kv_cache_device() -> str:
+        """Return device for KV cache allocation.
+
+        The MPS attention backend uses PyTorch SDPA and expects KV cache tensors
+        to live on the same device as the model (MPS).
+        """
+        return "mps"
+
 
 class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]):
     """Builder for MPS attention metadata."""

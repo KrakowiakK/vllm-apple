@@ -11,7 +11,7 @@ Key Principle: Encode-only API. No internal waits.
 QKV projection: hidden_states @ W_qkv -> [Q, K, V]
 
 The operation supports:
-- Fused QKV projection (single GEMM)
+- Fused QKV weights (single GEMM for num_tokens==1; sliced GEMMs for stacked layout otherwise)
 - Separate Q, K, V projections (three GEMMs)
 - With or without bias
 
@@ -201,7 +201,9 @@ class EngineQKVProjection:
         Args:
             step_ctx: EngineStepContext with encoder
             hidden_states: Input [num_tokens, hidden_size]
-            qkv_output: Output buffer for QKV [num_tokens, qkv_size]
+            qkv_output: Output buffer for QKV with size num_tokens * qkv_size.
+                        Layout is stacked by projection:
+                        [Q_all_tokens][K_all_tokens][V_all_tokens].
             num_tokens: Number of tokens
 
         Returns:
@@ -213,22 +215,108 @@ class EngineQKVProjection:
         element_size = 2  # float16
 
         if self.config.fused:
-            # Fused QKV projection
+            # Fused QKV projection.
+            #
+            # IMPORTANT: Downstream ops (RoPE/KVWrite/Attention) assume a stacked
+            # layout in the output buffer:
+            #   [Q_all_tokens][K_all_tokens][V_all_tokens]
+            #
+            # A single GEMM with output shape [num_tokens, qkv_size] produces a
+            # per-token row-interleaved layout:
+            #   [Q_token0 | K_token0 | V_token0][Q_token1 | K_token1 | V_token1]...
+            #
+            # These layouts are only equivalent when num_tokens == 1.
             if self._weight_buffer is None:
                 raise RuntimeError("Fused weights not set - call set_weights(qkv_weight=...) first")
 
-            # Encode GEMM: hidden @ W_qkv^T -> output
-            # Shape: [num_tokens, hidden_size] @ [hidden_size, qkv_size] -> [num_tokens, qkv_size]
-            self._gemm.encode(
-                step_ctx=step_ctx,
-                A=hidden_states,
-                B=self._weight_buffer,
-                C=qkv_output,
-                M=num_tokens,
-                K=self.config.hidden_size,
-                N=self.config.qkv_size,
-                transpose_B=True,  # Weight is [qkv_size, hidden_size]
-            )
+            if num_tokens == 1:
+                # Fast path: single-token layout matches stacked offsets.
+                self._gemm.encode(
+                    step_ctx=step_ctx,
+                    A=hidden_states,
+                    B=self._weight_buffer,
+                    C=qkv_output,
+                    M=num_tokens,
+                    K=self.config.hidden_size,
+                    N=self.config.qkv_size,
+                    transpose_B=True,  # Weight is [qkv_size, hidden_size]
+                )
+            else:
+                # Multi-token: use fused weights but write stacked output layout.
+                q_tensor = EngineTensor(
+                    buffer=qkv_output,
+                    shape=(num_tokens, self.config.q_size),
+                    dtype=EngineDType.FLOAT16,
+                    offset=0,
+                )
+
+                k_offset_bytes = num_tokens * self.config.q_size * element_size
+                k_tensor = EngineTensor(
+                    buffer=qkv_output,
+                    shape=(num_tokens, self.config.k_size),
+                    dtype=EngineDType.FLOAT16,
+                    offset=k_offset_bytes,
+                )
+
+                v_offset_bytes = num_tokens * (self.config.q_size + self.config.k_size) * element_size
+                v_tensor = EngineTensor(
+                    buffer=qkv_output,
+                    shape=(num_tokens, self.config.v_size),
+                    dtype=EngineDType.FLOAT16,
+                    offset=v_offset_bytes,
+                )
+
+                # Slice fused weight buffer (row-major [qkv_size, hidden_size]).
+                weight_row_bytes = self.config.hidden_size * element_size
+                q_weight = EngineTensor(
+                    buffer=self._weight_buffer,
+                    shape=(self.config.q_size, self.config.hidden_size),
+                    dtype=EngineDType.FLOAT16,
+                    offset=0,
+                )
+                k_weight = EngineTensor(
+                    buffer=self._weight_buffer,
+                    shape=(self.config.k_size, self.config.hidden_size),
+                    dtype=EngineDType.FLOAT16,
+                    offset=self.config.q_size * weight_row_bytes,
+                )
+                v_weight = EngineTensor(
+                    buffer=self._weight_buffer,
+                    shape=(self.config.v_size, self.config.hidden_size),
+                    dtype=EngineDType.FLOAT16,
+                    offset=(self.config.q_size + self.config.k_size) * weight_row_bytes,
+                )
+
+                self._gemm.encode(
+                    step_ctx=step_ctx,
+                    A=hidden_states,
+                    B=q_weight,
+                    C=q_tensor,
+                    M=num_tokens,
+                    K=self.config.hidden_size,
+                    N=self.config.q_size,
+                    transpose_B=True,
+                )
+                self._gemm.encode(
+                    step_ctx=step_ctx,
+                    A=hidden_states,
+                    B=k_weight,
+                    C=k_tensor,
+                    M=num_tokens,
+                    K=self.config.hidden_size,
+                    N=self.config.k_size,
+                    transpose_B=True,
+                )
+                self._gemm.encode(
+                    step_ctx=step_ctx,
+                    A=hidden_states,
+                    B=v_weight,
+                    C=v_tensor,
+                    M=num_tokens,
+                    K=self.config.hidden_size,
+                    N=self.config.v_size,
+                    transpose_B=True,
+                )
         else:
             # Separate Q, K, V projections
             if self._q_weight is None or self._k_weight is None or self._v_weight is None:

@@ -15,9 +15,9 @@ Features:
 - Memory tracking
 
 Usage:
-    from vllm_apple.engine.profiling import get_profiler, PROFILING_ENABLED
+    from vllm_apple.engine.profiling import get_profiler, is_profiling_enabled
 
-    if PROFILING_ENABLED:
+    if is_profiling_enabled():
         profiler = get_profiler()
         profiler.begin_step(step_id=0, step_kind="decode", num_tokens=4, num_seqs=4)
 
@@ -40,8 +40,25 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 # Environment variables for profiling
-PROFILING_ENABLED = os.environ.get("VLLM_METAL_PROFILE", "0") == "1"
-CAPTURE_TRACE = os.environ.get("VLLM_METAL_CAPTURE_NEXT_STEP", "0") == "1"
+# These are functions to allow runtime configuration (env vars can be set after import)
+def is_profiling_enabled() -> bool:
+    """Check if profiling is enabled via VLLM_METAL_PROFILE env var.
+
+    Unlike constants, this is evaluated at call time, allowing
+    env vars to be set after vllm imports.
+    """
+    return os.environ.get("VLLM_METAL_PROFILE", "0") == "1"
+
+
+def is_capture_trace_enabled() -> bool:
+    """Check if GPU trace capture is enabled via VLLM_METAL_CAPTURE_NEXT_STEP env var."""
+    return os.environ.get("VLLM_METAL_CAPTURE_NEXT_STEP", "0") == "1"
+
+
+# Backward-compatible aliases (deprecated)
+# These evaluate at import time, prefer using the functions above
+PROFILING_ENABLED = is_profiling_enabled()
+CAPTURE_TRACE = is_capture_trace_enabled()
 
 
 @dataclass
@@ -139,7 +156,7 @@ class EngineProfiler:
         self._current_step: Optional[StepProfile] = None
         self._timestamps: Dict[str, float] = {}
         self._step_counter: int = 0
-        self._enabled = PROFILING_ENABLED
+        self._enabled = is_profiling_enabled()  # Check at init time, not import time
 
     @property
     def enabled(self) -> bool:
@@ -410,9 +427,8 @@ def capture_gpu_trace(command_buffer: Any, step_id: int = 0) -> bool:
     Returns:
         True if capture was started, False otherwise
     """
-    global CAPTURE_TRACE
-
-    if not CAPTURE_TRACE:
+    # Check at runtime to allow env var to be set after import
+    if not is_capture_trace_enabled():
         return False
 
     try:
@@ -440,8 +456,8 @@ def capture_gpu_trace(command_buffer: Any, step_id: int = 0) -> bool:
 
         if success:
             logger.info(f"Started GPU trace capture to {output_path}")
-            # Disable after one capture
-            CAPTURE_TRACE = False
+            # Disable after one capture by clearing the env var
+            # (is_capture_trace_enabled() will return False on next check)
             os.environ["VLLM_METAL_CAPTURE_NEXT_STEP"] = "0"
             return True
         else:

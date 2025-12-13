@@ -72,7 +72,9 @@ from .boundary import (
 )
 
 from .profiling import (
-    PROFILING_ENABLED,
+    PROFILING_ENABLED,  # Deprecated: use is_profiling_enabled() instead
+    is_profiling_enabled,
+    is_capture_trace_enabled,
     get_profiler,
     StepProfile,
     ProfileSummary,
@@ -136,7 +138,9 @@ __all__ = [
     "validate_engine_outputs",
     "ensure_cpu_tensor",
     # Profiling
-    "PROFILING_ENABLED",
+    "PROFILING_ENABLED",  # Deprecated
+    "is_profiling_enabled",
+    "is_capture_trace_enabled",
     "get_profiler",
     "StepProfile",
     "ProfileSummary",

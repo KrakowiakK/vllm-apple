@@ -40,6 +40,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 # Import Apple-specific components
 from vllm_apple.v1.worker.apple_model_runner import AppleModelRunner
+from vllm_apple.engine.strict_mode import enable_strict_mode
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -185,6 +186,10 @@ class AppleWorker(WorkerBase):
         )
 
         logger.info("Apple Silicon device initialized successfully")
+
+        # Enable strict mode if VLLM_METAL_STRICT_NO_MPS=1
+        # This applies monkey-patches to detect torch.mps ops in hot path
+        enable_strict_mode()
 
     def load_model(self) -> None:
         """Load the model onto MPS device.
