@@ -54,14 +54,26 @@ class TransformerLayerWeights:
     # Fused QKV (alternative to separate)
     qkv_proj: Any = None  # [(num_heads + 2*num_kv_heads) * head_size, hidden_size]
 
+    # Attention biases (GPT-2)
+    qkv_bias: Any = None
+    o_proj_bias: Any = None
+
     # Norms
     input_layernorm: Any = None   # [hidden_size]
     post_attention_layernorm: Any = None  # [hidden_size]
+
+    # Norm biases (GPT-2 uses LayerNorm with bias)
+    input_layernorm_bias: Any = None
+    post_attention_layernorm_bias: Any = None
 
     # MLP
     gate_proj: Any = None  # [intermediate_size, hidden_size]
     up_proj: Any = None    # [intermediate_size, hidden_size]
     down_proj: Any = None  # [hidden_size, intermediate_size]
+
+    # MLP biases (GPT-2)
+    up_proj_bias: Any = None
+    down_proj_bias: Any = None
 
     # Fused gate-up (alternative)
     gate_up_proj: Any = None  # [2 * intermediate_size, hidden_size]
@@ -73,11 +85,15 @@ class ModelWeights:
     # Token embedding
     embedding: Any = None  # [vocab_size, hidden_size]
 
+    # Position embedding (GPT-2)
+    pos_embedding: Any = None  # [max_pos, hidden_size]
+
     # Transformer layers
     layers: List[TransformerLayerWeights] = field(default_factory=list)
 
     # Final norm
     final_norm: Any = None  # [hidden_size]
+    final_norm_bias: Any = None  # [hidden_size] (GPT-2)
 
     # LM head
     lm_head: Any = None  # [vocab_size, hidden_size]
@@ -124,6 +140,7 @@ class EngineWeightLoader:
         self._arch_mappings = {
             "qwen2": self._get_qwen2_mapping(),
             "llama": self._get_llama_mapping(),
+            "gpt2": self._get_gpt2_mapping(),
         }
 
         logger.info("EngineWeightLoader initialized")
@@ -149,6 +166,29 @@ class EngineWeightLoader:
     def _get_llama_mapping(self) -> Dict[str, str]:
         """Get weight name mapping for LLaMA architecture."""
         return self._get_qwen2_mapping()  # Same structure
+
+    def _get_gpt2_mapping(self) -> Dict[str, str]:
+        """Get weight name mapping for GPT-2 architecture."""
+        return {
+            "transformer.wte.weight": "embedding",
+            "transformer.wpe.weight": "pos_embedding",  # GPT-2 has position embeddings
+            "transformer.ln_f.weight": "final_norm",
+            "transformer.ln_f.bias": "final_norm_bias",
+            "lm_head.weight": "lm_head",  # May be tied to wte
+            # Layer patterns
+            "transformer.h.{}.attn.c_attn.weight": "c_attn",  # Fused QKV
+            "transformer.h.{}.attn.c_attn.bias": "c_attn_bias",
+            "transformer.h.{}.attn.c_proj.weight": "o_proj",
+            "transformer.h.{}.attn.c_proj.bias": "o_proj_bias",
+            "transformer.h.{}.ln_1.weight": "input_layernorm",
+            "transformer.h.{}.ln_1.bias": "input_layernorm_bias",
+            "transformer.h.{}.ln_2.weight": "post_attention_layernorm",
+            "transformer.h.{}.ln_2.bias": "post_attention_layernorm_bias",
+            "transformer.h.{}.mlp.c_fc.weight": "up_proj",  # GPT-2 MLP
+            "transformer.h.{}.mlp.c_fc.bias": "up_proj_bias",
+            "transformer.h.{}.mlp.c_proj.weight": "down_proj",
+            "transformer.h.{}.mlp.c_proj.bias": "down_proj_bias",
+        }
 
     def _tensor_to_mtlbuffer(
         self,
@@ -178,23 +218,20 @@ class EngineWeightLoader:
         # Get numpy array
         np_array = tensor.numpy()
 
-        # Allocate MTLBuffer
+        # Ensure contiguous C-order array for correct memory layout
+        np_array = np.ascontiguousarray(np_array)
         size_bytes = np_array.nbytes
-        buffer = self._context.device.newBufferWithLength_options_(
+
+        # Create MTLBuffer with bytes directly - this is more reliable than
+        # trying to copy into an existing buffer with PyObjC
+        buffer = self._context.device.newBufferWithBytes_length_options_(
+            np_array.tobytes(),
             size_bytes,
             MTLResourceStorageModeShared,
         )
 
         if buffer is None:
             raise RuntimeError(f"Failed to allocate MTLBuffer for {name} ({size_bytes} bytes)")
-
-        # Copy data to buffer
-        import ctypes
-        ctypes.memmove(
-            buffer.contents(),
-            np_array.ctypes.data,
-            size_bytes,
-        )
 
         logger.debug(f"Loaded weight {name}: shape={tensor.shape}, size={size_bytes / 1024 / 1024:.2f}MB")
         return buffer
@@ -230,7 +267,13 @@ class EngineWeightLoader:
         Returns:
             ModelWeights with all weights loaded to MTLBuffer
         """
-        mapping = self._arch_mappings.get(arch, self._get_qwen2_mapping())
+        if arch == "gpt2":
+            return self._load_gpt2_weights(state_dict)
+        else:
+            return self._load_llama_weights(state_dict)
+
+    def _load_llama_weights(self, state_dict: Dict[str, Any]) -> ModelWeights:
+        """Load weights for Llama/Qwen2 architecture."""
         weights = ModelWeights()
 
         # Detect number of layers
@@ -298,6 +341,107 @@ class EngineWeightLoader:
             weights.head_size = weights.hidden_size // weights.num_attention_heads
 
         # Check for tied embeddings
+        if weights.lm_head is None and weights.embedding is not None:
+            logger.info("LM head tied to embedding weights")
+            weights.lm_head = weights.embedding
+
+        logger.info(
+            f"Loaded model weights: {weights.num_layers} layers, "
+            f"hidden_size={weights.hidden_size}, vocab_size={weights.vocab_size}, "
+            f"intermediate_size={weights.intermediate_size}"
+        )
+
+        return weights
+
+    def _load_gpt2_weights(self, state_dict: Dict[str, Any]) -> ModelWeights:
+        """Load weights for GPT-2 architecture."""
+        weights = ModelWeights()
+
+        # Detect number of layers from transformer.h.X pattern
+        num_layers = 0
+        for key in state_dict.keys():
+            if "transformer.h." in key:
+                parts = key.split(".")
+                for i, part in enumerate(parts):
+                    if part == "h" and i + 1 < len(parts):
+                        try:
+                            layer_idx = int(parts[i + 1])
+                            num_layers = max(num_layers, layer_idx + 1)
+                        except ValueError:
+                            pass
+
+        weights.num_layers = num_layers
+        weights.layers = [TransformerLayerWeights() for _ in range(num_layers)]
+
+        # Load non-layer weights
+        for key, tensor in state_dict.items():
+            if "transformer.h." not in key:
+                if key == "transformer.wte.weight":
+                    weights.embedding = self._tensor_to_mtlbuffer(tensor, "embedding")
+                    weights.vocab_size = tensor.shape[0]
+                    weights.hidden_size = tensor.shape[1]
+                elif key == "transformer.wpe.weight":
+                    # Position embeddings - store separately
+                    weights.pos_embedding = self._tensor_to_mtlbuffer(tensor, "pos_embedding")
+                elif key == "transformer.ln_f.weight":
+                    weights.final_norm = self._tensor_to_mtlbuffer(tensor, "final_norm")
+                elif key == "transformer.ln_f.bias":
+                    weights.final_norm_bias = self._tensor_to_mtlbuffer(tensor, "final_norm_bias")
+                elif key == "lm_head.weight":
+                    weights.lm_head = self._tensor_to_mtlbuffer(tensor, "lm_head")
+
+        # Load layer weights
+        for layer_idx in range(num_layers):
+            layer = weights.layers[layer_idx]
+            prefix = f"transformer.h.{layer_idx}."
+
+            for key, tensor in state_dict.items():
+                if not key.startswith(prefix):
+                    continue
+
+                suffix = key[len(prefix):]
+
+                if suffix == "attn.c_attn.weight":
+                    # GPT-2 has fused QKV as c_attn [3*hidden, hidden]
+                    # Store as qkv_proj (fused)
+                    layer.qkv_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.qkv_proj")
+                    # Also extract Q, K, V for compatibility
+                    hidden = weights.hidden_size
+                    layer.q_proj = self._tensor_to_mtlbuffer(tensor[:hidden, :], f"layer{layer_idx}.q_proj")
+                    layer.k_proj = self._tensor_to_mtlbuffer(tensor[hidden:2*hidden, :], f"layer{layer_idx}.k_proj")
+                    layer.v_proj = self._tensor_to_mtlbuffer(tensor[2*hidden:, :], f"layer{layer_idx}.v_proj")
+                elif suffix == "attn.c_attn.bias":
+                    layer.qkv_bias = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.qkv_bias")
+                elif suffix == "attn.c_proj.weight":
+                    layer.o_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.o_proj")
+                elif suffix == "attn.c_proj.bias":
+                    layer.o_proj_bias = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.o_proj_bias")
+                elif suffix == "ln_1.weight":
+                    layer.input_layernorm = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.input_ln")
+                elif suffix == "ln_1.bias":
+                    layer.input_layernorm_bias = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.input_ln_bias")
+                elif suffix == "ln_2.weight":
+                    layer.post_attention_layernorm = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.post_attn_ln")
+                elif suffix == "ln_2.bias":
+                    layer.post_attention_layernorm_bias = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.post_attn_ln_bias")
+                elif suffix == "mlp.c_fc.weight":
+                    # GPT-2 MLP: up projection
+                    layer.up_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.up_proj")
+                    weights.intermediate_size = tensor.shape[0]
+                elif suffix == "mlp.c_fc.bias":
+                    layer.up_proj_bias = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.up_proj_bias")
+                elif suffix == "mlp.c_proj.weight":
+                    # GPT-2 MLP: down projection
+                    layer.down_proj = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.down_proj")
+                elif suffix == "mlp.c_proj.bias":
+                    layer.down_proj_bias = self._tensor_to_mtlbuffer(tensor, f"layer{layer_idx}.down_proj_bias")
+
+        # GPT-2 uses same num heads as hidden/64
+        if weights.hidden_size > 0:
+            weights.num_attention_heads = weights.hidden_size // 64  # GPT-2 head size is 64
+            weights.head_size = 64
+
+        # Check for tied embeddings (common in GPT-2)
         if weights.lm_head is None and weights.embedding is not None:
             logger.info("LM head tied to embedding weights")
             weights.lm_head = weights.embedding

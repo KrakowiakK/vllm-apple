@@ -277,16 +277,31 @@ class AppleModelRunner:
         context = MetalEngineContext()
 
         # Create model descriptor from config
+        # Note: Some methods need parallel_config for tensor parallelism
+        parallel_config = self.vllm_config.parallel_config
+        hf_config = self.model_config.hf_config
+        hidden_size = self.model_config.get_hidden_size()
+
+        # Get intermediate_size from hf_config (different names per architecture)
+        intermediate_size = getattr(hf_config, 'intermediate_size', None)
+        if intermediate_size is None:
+            # GPT-2 uses n_inner (or 4 * n_embd if not set)
+            intermediate_size = getattr(hf_config, 'n_inner', None)
+            if intermediate_size is None:
+                intermediate_size = 4 * hidden_size
+
         model_desc = ModelDescriptor(
-            hidden_size=self.model_config.get_hidden_size(),
-            num_attention_heads=self.model_config.get_num_attention_heads(),
-            num_kv_heads=self.model_config.get_num_kv_heads(),
-            num_layers=self.model_config.get_num_layers(),
+            hidden_size=hidden_size,
+            num_attention_heads=self.model_config.get_num_attention_heads(
+                parallel_config
+            ),
+            num_kv_heads=self.model_config.get_num_kv_heads(parallel_config),
+            num_layers=self.model_config.get_num_layers(parallel_config),
             head_size=self.model_config.get_head_size(),
-            intermediate_size=self.model_config.get_intermediate_size(),
+            intermediate_size=intermediate_size,
             vocab_size=self.vocab_size,
-            max_position=self.max_model_len,
-            rope_theta=getattr(self.model_config.hf_config, 'rope_theta', 10000.0),
+            max_position_embeddings=self.max_model_len,
+            rope_theta=getattr(hf_config, 'rope_theta', 10000.0),
         )
 
         # Engine KV cache will be initialized in initialize_kv_cache
@@ -501,8 +516,8 @@ class AppleModelRunner:
         # Create engine KV cache
         # The engine will use MTLBuffer for KV storage
         engine_kv_cache = EngineKVCache(
-            context=self._engine_context,
-            desc=kv_desc,
+            engine_context=self._engine_context,
+            descriptor=kv_desc,
         )
 
         # Load weights from PyTorch model to MTLBuffer
@@ -513,7 +528,13 @@ class AppleModelRunner:
 
         # Determine architecture from model type
         model_type = getattr(self.model_config.hf_config, 'model_type', 'llama')
-        arch = 'qwen2' if 'qwen' in model_type.lower() else 'llama'
+        model_type_lower = model_type.lower()
+        if 'qwen' in model_type_lower:
+            arch = 'qwen2'
+        elif 'gpt2' in model_type_lower:
+            arch = 'gpt2'
+        else:
+            arch = 'llama'
 
         weights = weight_loader.load_from_hf_model(self.model, arch=arch)
 
