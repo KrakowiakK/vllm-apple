@@ -39,6 +39,7 @@ dev = [
     "black",
     "isort",
     "mypy",
+    "build",
 ]
 
 [project.entry-points."vllm.platform_plugins"]

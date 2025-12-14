@@ -14,7 +14,7 @@ Environment Variables:
     VLLM_APPLE_ENGINE_PREFILL:
         Enable running prefill/mixed steps in the engine. When disabled,
         prefill continues to route through the PyTorch path (and may require
-        KV cache sync). Default: "0"
+        KV cache sync). Default: "1"
 
     VLLM_METAL_STRICT_NO_MPS:
         Enable strict mode that raises RuntimeError if any PyTorch-MPS
@@ -78,7 +78,10 @@ def is_engine_prefill_enabled() -> bool:
     Returns:
         True if VLLM_APPLE_ENGINE_PREFILL=1
     """
-    return os.environ.get(ENGINE_PREFILL_ENV, "0") == "1"
+    # Prefill is enabled by default when engine mode is enabled; users can opt out.
+    # When engine mode is disabled, default to off to avoid surprising behavior.
+    default = "1" if is_engine_mode_enabled() else "0"
+    return os.environ.get(ENGINE_PREFILL_ENV, default) == "1"
 
 
 def is_strict_mode_enabled() -> bool:

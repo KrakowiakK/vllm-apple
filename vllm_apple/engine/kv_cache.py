@@ -514,6 +514,16 @@ class EngineKVCache:
         """
         import torch
         import ctypes
+        from .strict_mode import is_strict_mode
+
+        # This sync bridge is intentionally NOT strict-mode compliant.
+        # Strict mode must not silently introduce PyTorch-MPS sync points.
+        if is_strict_mode():
+            raise RuntimeError(
+                "sync_from_torch_cache() is not allowed in strict mode "
+                "(VLLM_METAL_STRICT_NO_MPS=1). Enable engine prefill "
+                "(VLLM_APPLE_ENGINE_PREFILL=1) or disable strict mode."
+            )
 
         if len(torch_caches) != self._desc.num_layers:
             raise ValueError(

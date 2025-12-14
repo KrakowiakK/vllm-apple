@@ -473,6 +473,10 @@ class AppleModelRunner:
 
         logger.info("Allocating KV cache: %d blocks for %d layers", num_blocks, len(kv_cache_spec))
 
+        # In engine mode with engine prefill enabled, the engine-owned MTLBuffer KV cache
+        # is the single source of truth. vLLM KV tensors are stubs only (no full duplication).
+        use_stub_kv_cache = self._use_engine_mode and is_engine_prefill_enabled()
+
         for layer_name, layer_spec in kv_cache_spec.items():
             if isinstance(layer_spec, FullAttentionSpec):
                 # Allocate combined key and value cache as single tensor
@@ -480,7 +484,7 @@ class AppleModelRunner:
                 # This allows kv_cache.unbind(0) -> (key_cache, value_cache)
                 cache_shape = (
                     2,  # K and V stacked
-                    num_blocks,
+                    0 if use_stub_kv_cache else num_blocks,
                     layer_spec.block_size,
                     layer_spec.num_kv_heads,
                     layer_spec.head_size,
@@ -498,12 +502,12 @@ class AppleModelRunner:
                     cache_size_gb,
                 )
 
-                # Create single stacked tensor for K and V
-                # Use kv_cache_device (CPU for Metal backend, MPS otherwise)
+                # Create single stacked tensor for K and V. In engine mode, allocate
+                # stubs on CPU; in non-engine mode use the backend-selected device.
                 kv_cache = torch.zeros(
                     cache_shape,
                     dtype=layer_spec.dtype,
-                    device=self.kv_cache_device,
+                    device="cpu" if use_stub_kv_cache else self.kv_cache_device,
                 )
 
                 self.kv_caches.append(kv_cache)
@@ -518,33 +522,48 @@ class AppleModelRunner:
                 # Allocate with default parameters
                 cache_shape = (
                     2,  # K and V stacked
-                    num_blocks,
+                    0 if use_stub_kv_cache else num_blocks,
                     self.block_size,
                     layer_spec.num_kv_heads if hasattr(layer_spec, 'num_kv_heads') else 8,
                     layer_spec.head_size if hasattr(layer_spec, 'head_size') else 128,
                 )
-                kv_cache = torch.zeros(cache_shape, dtype=self.dtype, device=self.kv_cache_device)
+                kv_cache = torch.zeros(
+                    cache_shape,
+                    dtype=self.dtype,
+                    device="cpu" if use_stub_kv_cache else self.kv_cache_device,
+                )
                 self.kv_caches.append(kv_cache)
 
-        # Bind KV caches to model's attention layers
-        kv_caches_dict = {}
-        for idx, (layer_name, _) in enumerate(kv_cache_spec.items()):
-            kv_caches_dict[layer_name] = self.kv_caches[idx]
+        if not use_stub_kv_cache:
+            # Bind KV caches to model's attention layers (PyTorch execution path).
+            kv_caches_dict = {}
+            for idx, (layer_name, _) in enumerate(kv_cache_spec.items()):
+                kv_caches_dict[layer_name] = self.kv_caches[idx]
 
-        # Use the bind_kv_cache utility to connect caches to the forward context
-        runner_kv_caches: list[torch.Tensor] = []
-        bind_kv_cache(
-            kv_caches_dict,
-            self.vllm_config.compilation_config.static_forward_context,
-            runner_kv_caches,
-        )
+            # Use the bind_kv_cache utility to connect caches to the forward context
+            runner_kv_caches: list[torch.Tensor] = []
+            bind_kv_cache(
+                kv_caches_dict,
+                self.vllm_config.compilation_config.static_forward_context,
+                runner_kv_caches,
+            )
 
-        # Calculate total cache size
-        # kv_caches is now list of stacked tensors [2, num_blocks, block_size, num_kv_heads, head_size]
-        total_cache_gb = sum(
-            kv_cache.numel() * get_dtype_size(kv_cache.dtype) / (1024**3)
-            for kv_cache in self.kv_caches
-        )
+        # Calculate total cache size (for logging).
+        if use_stub_kv_cache:
+            # Engine KV layout: [num_blocks, num_kv_heads, block_size, head_size] for K and V.
+            first_spec = next(iter(kv_cache_spec.values()))
+            num_kv_heads = first_spec.num_kv_heads if hasattr(first_spec, "num_kv_heads") else 8
+            head_size = first_spec.head_size if hasattr(first_spec, "head_size") else 128
+            dtype_size = get_dtype_size(first_spec.dtype) if hasattr(first_spec, "dtype") else get_dtype_size(self.dtype)
+            elements_per_layer = num_blocks * self.block_size * num_kv_heads * head_size
+            total_cache_bytes = elements_per_layer * dtype_size * 2 * len(kv_cache_spec)
+            total_cache_gb = total_cache_bytes / (1024**3)
+        else:
+            # kv_caches is now list of stacked tensors [2, num_blocks, block_size, num_kv_heads, head_size]
+            total_cache_gb = sum(
+                kv_cache.numel() * get_dtype_size(kv_cache.dtype) / (1024**3)
+                for kv_cache in self.kv_caches
+            )
 
         logger.info(
             "KV cache allocated: %d blocks, %d layers, %.2f GB total",
@@ -555,7 +574,33 @@ class AppleModelRunner:
 
         # Complete engine runner initialization if engine mode enabled
         if self._use_engine_mode and hasattr(self, '_engine_context'):
-            self._complete_engine_runner_init(num_blocks, kv_cache_spec)
+            try:
+                self._complete_engine_runner_init(num_blocks, kv_cache_spec)
+            except Exception as e:
+                # Engine KV cache is the single source of truth only if the engine
+                # runner is fully initialized. If init fails:
+                # - strict mode: fail fast (no silent fallback)
+                # - non-strict: fall back to the PyTorch path (allocate real KV caches)
+                if is_strict_mode():
+                    logger.error(
+                        "Engine runner initialization failed in strict mode: %s\n"
+                        "Strict mode (VLLM_METAL_STRICT_NO_MPS=1) does not allow "
+                        "silent fallback to PyTorch/MPS.", e
+                    )
+                    raise
+
+                logger.warning(
+                    "Engine runner initialization failed, falling back to PyTorch/MPS: %s\n"
+                    "To require engine mode, set VLLM_METAL_STRICT_NO_MPS=1", e
+                )
+                self._use_engine_mode = False
+                self._engine_runner = None
+                self._engine_kv_cache = None
+
+                # If we allocated stub KV caches for engine mode, replace them with
+                # real PyTorch KV caches and bind them for the fallback path.
+                if use_stub_kv_cache:
+                    self._allocate_full_torch_kv_cache(num_blocks, kv_cache_spec)
 
     def _complete_engine_runner_init(
         self,
@@ -593,7 +638,7 @@ class AppleModelRunner:
             block_size=self.block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
-            num_layers=len(self.kv_caches),
+            num_layers=len(kv_cache_spec),
         )
 
         # Create engine KV cache
@@ -635,6 +680,72 @@ class AppleModelRunner:
             self._engine_model_desc.num_layers,
             num_blocks,
             self.block_size,
+        )
+
+    def _allocate_full_torch_kv_cache(
+        self,
+        num_blocks: int,
+        kv_cache_spec: dict,
+    ) -> None:
+        """Allocate and bind full torch KV caches for the PyTorch path.
+
+        This is used as a fallback when engine mode is enabled but the engine
+        runner fails to initialize. It reverts to the standard vLLM behavior
+        where attention layers read/write torch KV tensors.
+        """
+        self.kv_caches = []
+
+        for layer_name, layer_spec in kv_cache_spec.items():
+            if isinstance(layer_spec, FullAttentionSpec):
+                cache_shape = (
+                    2,  # K and V stacked
+                    num_blocks,
+                    layer_spec.block_size,
+                    layer_spec.num_kv_heads,
+                    layer_spec.head_size,
+                )
+                kv_cache = torch.zeros(
+                    cache_shape,
+                    dtype=layer_spec.dtype,
+                    device=self.kv_cache_device,
+                )
+                self.kv_caches.append(kv_cache)
+            else:
+                cache_shape = (
+                    2,  # K and V stacked
+                    num_blocks,
+                    self.block_size,
+                    layer_spec.num_kv_heads if hasattr(layer_spec, 'num_kv_heads') else 8,
+                    layer_spec.head_size if hasattr(layer_spec, 'head_size') else 128,
+                )
+                kv_cache = torch.zeros(
+                    cache_shape,
+                    dtype=self.dtype,
+                    device=self.kv_cache_device,
+                )
+                self.kv_caches.append(kv_cache)
+
+        # Bind to the forward context used by attention layers.
+        kv_caches_dict = {}
+        for idx, (layer_name, _) in enumerate(kv_cache_spec.items()):
+            kv_caches_dict[layer_name] = self.kv_caches[idx]
+
+        runner_kv_caches: list[torch.Tensor] = []
+        bind_kv_cache(
+            kv_caches_dict,
+            self.vllm_config.compilation_config.static_forward_context,
+            runner_kv_caches,
+        )
+
+        total_cache_gb = sum(
+            kv_cache.numel() * get_dtype_size(kv_cache.dtype) / (1024**3)
+            for kv_cache in self.kv_caches
+        )
+        logger.info(
+            "Fallback torch KV cache allocated: %d blocks, %d layers, %.2f GB total",
+            num_blocks,
+            len(self.kv_caches),
+            total_cache_gb,
         )
 
     def profile_run(self) -> None:
@@ -1303,12 +1414,19 @@ class AppleModelRunner:
         """
         # Engine mode path (v2.0 Metal engine)
         if self._use_engine_mode and self._engine_runner is not None:
-            # Check if this is a prefill step - engine only supports decode
             # Detect prefill from attn_metadata: num_decode_tokens < num_actual_tokens
             attn_metadata = model_input.attn_metadata
             has_prefill = attn_metadata.num_decode_tokens < attn_metadata.num_actual_tokens
 
             if has_prefill and not is_engine_prefill_enabled():
+                if is_strict_mode():
+                    raise RuntimeError(
+                        "Engine mode is enabled but engine prefill is disabled "
+                        "(VLLM_APPLE_ENGINE_PREFILL=0). Strict mode "
+                        "(VLLM_METAL_STRICT_NO_MPS=1) does not allow routing "
+                        "prefill through PyTorch/MPS with KV sync. Enable engine "
+                        "prefill (VLLM_APPLE_ENGINE_PREFILL=1) or disable strict mode."
+                    )
                 # Default behavior: route prefill through PyTorch and sync KV for decode.
                 logger.debug(
                     f"Prefill step (num_tokens={model_input.num_scheduled_tokens}, "

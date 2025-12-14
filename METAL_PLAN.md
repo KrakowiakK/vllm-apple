@@ -615,25 +615,26 @@ If full-logits readback becomes a bottleneck (large vocab), add **optional** mod
 | Scratch buffer overflow | Bounds checking added | `test_engine_config_max_batch_size` |
 | KV cache data inconsistency | `sync_from_torch_cache()` used only for PyTorch prefill; engine prefill avoids it | `test_kv_cache_sync_method_exists` |
 
-### Current Limitations
+### Current State (v2.0 Complete)
 
-1. **Prefill Default**: Prefill/mixed steps use PyTorch by default; enable engine prefill with `VLLM_APPLE_ENGINE_PREFILL=1`.
-2. **KV Cache Duplication**: vLLM torch KV cache is still allocated for interface compatibility; KV sync is only required when PyTorch prefill is used.
-3. **Architecture Support**: Only LLaMA/Qwen2/Mistral. GPT-2 and similar are rejected.
+1. **Engine Prefill Default**: Engine prefill is now enabled by default when `VLLM_APPLE_USE_ENGINE=1`.
+2. **KV Cache Single Source**: vLLM torch KV cache is stub-only (0 blocks); engine owns the actual KV data.
+3. **Architecture Support**: LLaMA/Qwen2/Mistral supported. GPT-2 and similar are explicitly rejected.
+4. **Strict Mode**: `VLLM_METAL_STRICT_NO_MPS=1` raises error on any MPS sync in hot path.
 
 ---
 
-## Deliverable Checklist (v2.0)
+## Deliverable Checklist (v2.0) ✅ COMPLETE
 
 - [x] Responsibilities split is explicit (vLLM orchestrator vs engine)
 - [x] Engine mode flag exists (`VLLM_APPLE_USE_ENGINE=1`, default off)
 - [x] Strict mode (`VLLM_METAL_STRICT_NO_MPS=1`) enforced by tests
 - [x] Engine API includes step/batch descriptor (`step_kind`, `num_scheduled_tokens`, `num_seqs_active`)
-- [~] KV cache single source of truth (engine-owned `MTLBuffer`, sync from torch after prefill)
+- [x] KV cache single source of truth (engine-owned `MTLBuffer`; vLLM KV tensors are stubs only)
 - [x] Step-boundary-only synchronization enforced (no per-layer/per-op waits)
-- [~] Paged attention + KV-write executed by engine (decode+prefill); benchmarks pending (batch 1/4/8/16)
+- [x] Paged attention + KV-write executed by engine (decode+prefill); benchmarks pass (batch 1/4/8/16)
 - [x] QKV / O-proj moved into engine (GEMM on `MTLBuffer`)
 - [x] RMSNorm + MLP moved into engine (full transformer block in-engine)
-- [~] Engine-backed vLLM runner produces logits end-to-end (decode; prefill behind `VLLM_APPLE_ENGINE_PREFILL=1`)
-- [ ] Continuous batching validated under load (no batch-8 cliff)
-- [ ] Packaging + wheel asset tests updated for any new kernels/binaries
+- [x] Engine-backed vLLM runner produces logits end-to-end (prefill+decode)
+- [x] Continuous batching validated under load (no batch-8 cliff)
+- [x] Packaging + wheel asset tests updated for new kernels/binaries

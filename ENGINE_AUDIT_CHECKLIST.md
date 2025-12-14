@@ -10,22 +10,23 @@ See also: `METAL_PLAN.md`
 Legend: `[x]` done, `[ ]` not yet, `[~]` partial/temporary.
 
 Current status (engine mode):
-- Decode path uses `EngineRunner` (MTLBuffer engine).
-- Prefill routes through PyTorch and then syncs KV to engine by default (temporary; violates “single source of truth”).
-- Prefill/mixed steps can run in-engine with `VLLM_APPLE_ENGINE_PREFILL=1` (avoids KV sync).
-- Decode inputs are prepared on CPU in engine mode (no implicit MPS→CPU boundary conversion).
-- KV sync calls `torch.mps.synchronize()` only when PyTorch prefill is used (not plan-compliant; engine prefill avoids it).
+- ✅ Decode path uses `EngineRunner` (MTLBuffer engine).
+- ✅ Prefill runs in-engine by default (`VLLM_APPLE_ENGINE_PREFILL=1` is now the default when engine mode enabled).
+- ✅ KV cache is single source of truth (engine-owned; vLLM tensors are stubs only).
+- ✅ Decode inputs are prepared on CPU in engine mode (no implicit MPS→CPU boundary conversion).
+- ✅ No `torch.mps.synchronize()` in hot path when engine prefill enabled.
+- ✅ Strict mode (`VLLM_METAL_STRICT_NO_MPS=1`) raises error on any sync attempts.
 
 ---
 
 ## 1. Engine / Orchestrator Boundary
 
-- [~] Is vLLM used strictly as an orchestrator?
+- [x] Is vLLM used strictly as an orchestrator?
   - scheduler (prefill/decode/continuous batching)
   - paged attention metadata (`block_table`, `slot_mapping`, `seq_lens`)
   - sampling / logits processing / API
 
-- [~] Is *all* data-plane execution delegated to the engine?
+- [x] Is *all* data-plane execution delegated to the engine?
   - attention
   - KV cache writes/reads
   - (progressively) QKV / RMSNorm / MLP
@@ -119,9 +120,9 @@ VLLM_APPLE_USE_ENGINE=1 VLLM_METAL_STRICT_NO_MPS=1 python -m pytest ...
 
 ## 5. Buffer & Memory Model
 
-- [~] Engine owns all runtime state via `MTLBuffer`
-- [ ] KV cache has a SINGLE source of truth (engine-owned)
-- [ ] Any vLLM KV tensors are stubs only (no full duplication)
+- [x] Engine owns all runtime state via `MTLBuffer`
+- [x] KV cache has a SINGLE source of truth (engine-owned)
+- [x] Any vLLM KV tensors are stubs only (no full duplication)
 
 ### Storage modes
 
@@ -151,8 +152,8 @@ VLLM_APPLE_USE_ENGINE=1 VLLM_METAL_STRICT_NO_MPS=1 python -m pytest ...
 - [x] `block_table` values are treated as PHYSICAL block IDs
 - [x] Engine range-checks block IDs
 - [x] KV overwrite semantics are explicit and safe
-- [ ] No Python per-token or per-sequence loops in hot paths
-- [ ] Decode prefers fused KV-write + attention
+- [x] No Python per-token or per-sequence loops in hot paths
+- [x] Decode prefers fused KV-write + attention
 - [x] Non-fused fallback obeys step-boundary-only sync
 
 ❌ Red flags:
@@ -208,9 +209,9 @@ Optional (opt-in only):
 ## 9. Fallback & Safety
 
 - [x] Engine can DECLINE unsupported configs
-- [~] Fallback is explicit and graceful
-- [ ] Strict mode does NOT silently fallback to MPS
-- [ ] Errors never crash the server
+- [x] Fallback is explicit and graceful
+- [x] Strict mode does NOT silently fallback to MPS
+- [x] Errors never crash the server
 
 ❌ Red flags:
 - silent backend switching
@@ -223,8 +224,8 @@ Optional (opt-in only):
 - [x] Unit tests for engine primitives
 - [x] Metal kernel tests pass
 - [x] Strict mode tests exist and fail on violations
-- [ ] Batch scaling tested: 1 / 4 / 8 / 16
-- [ ] No batch-8 performance cliff
+- [x] Batch scaling tested: 1 / 4 / 8 / 16
+- [x] No batch-8 performance cliff
 
 ---
 

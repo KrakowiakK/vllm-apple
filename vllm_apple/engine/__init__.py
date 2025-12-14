@@ -22,7 +22,7 @@ Usage:
 
 Environment Variables:
     VLLM_APPLE_USE_ENGINE: Enable v2.0 engine mode (default: 0)
-    VLLM_APPLE_ENGINE_PREFILL: Enable engine prefill/mixed steps (default: 0)
+    VLLM_APPLE_ENGINE_PREFILL: Enable engine prefill/mixed steps (default: 1 when engine mode is enabled)
     VLLM_METAL_STRICT_NO_MPS: Strict mode - raise on MPS in hot path (default: 0)
     VLLM_METAL_PROFILE: Enable step-level profiling (default: 0)
     VLLM_METAL_CAPTURE_NEXT_STEP: Capture GPU trace via MTLCaptureManager (default: 0)
