@@ -317,14 +317,8 @@ class AppleWorker(WorkerBase):
                 # Total expert tokens = num_tokens * topk (each token goes to topk experts)
                 total_expert_tokens = num_tokens * topk
 
-                # Debug logging (once)
+                # Mark as logged (kept for potential future debug logging)
                 if not _fused_experts_debug_logged[0]:
-                    print(f"[MoE Debug] hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-                    print(f"[MoE Debug] w1 shape: {w1.shape}, dtype: {w1.dtype}")
-                    print(f"[MoE Debug] w2 shape: {w2.shape}, dtype: {w2.dtype}")
-                    print(f"[MoE Debug] topk_weights shape: {topk_weights.shape}, dtype: {topk_weights.dtype}")
-                    print(f"[MoE Debug] topk_ids shape: {topk_ids.shape}, dtype: {topk_ids.dtype}")
-                    print(f"[MoE Debug] activation: {activation}")
                     _fused_experts_debug_logged[0] = True
 
                 # ADAPTIVE MoE COMBINE LOGIC
@@ -368,11 +362,6 @@ class AppleWorker(WorkerBase):
                 max_entropy = torch.log(torch.tensor(num_experts, dtype=torch.float32)).item()
                 normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
 
-                # Debug logging (periodic)
-                if _moe_profile['call_count'] % 480 == 0 and _moe_profile['call_count'] > 0:
-                    print(f"[MoE Adaptive] tokens={num_tokens}, expert_tokens={total_expert_tokens}, "
-                          f"unique={unique_experts}/{num_experts}, entropy={normalized_entropy:.3f}, "
-                          f"use_combined={use_combined} ({combine_reason})")
 
                 w1_elements = w1.shape[1] * w1.shape[2]
                 w2_elements = w2.shape[1] * w2.shape[2]
@@ -520,20 +509,11 @@ class AppleWorker(WorkerBase):
                 if _detail_timing:
                     torch.mps.synchronize()
                     _reduce_ms = (_time.perf_counter() - _t_reduce) * 1000
-                    _total_detail = _flatten_ms + _alloc_ms + _index_select_ms + _bmm1_ms + _act_ms + _bmm2_ms + _store_ms + _reduce_ms
-                    if _moe_profile['call_count'] % 48 == 0:  # Once per forward pass
-                        print(f"[MoE Detail] tokens={num_tokens}, chunks={total_expert_tokens//CHUNK_SIZE + 1}, "
-                              f"flatten={_flatten_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
-                              f"index_select={_index_select_ms:.1f}ms, bmm1={_bmm1_ms:.1f}ms, "
-                              f"act={_act_ms:.1f}ms, bmm2={_bmm2_ms:.1f}ms, store={_store_ms:.1f}ms, "
-                              f"reduce={_reduce_ms:.1f}ms, total={_total_detail:.1f}ms")
 
-                # Profiling
+                # Profiling (counters kept for potential analysis)
                 _moe_profile['call_count'] += 1
                 _moe_profile['total_ms'] += (_time.perf_counter() - _t_start) * 1000
-                if _moe_profile['call_count'] % 480 == 0:  # Every 10 forward passes (48 layers × 10)
-                    avg_ms = _moe_profile['total_ms'] / _moe_profile['call_count']
-                    print(f"[MoE Profile] calls={_moe_profile['call_count']}, total={_moe_profile['total_ms']:.1f}ms, avg={avg_ms:.3f}ms/call")
+                if _moe_profile['call_count'] % 480 == 0:
                     _moe_profile['total_ms'] = 0.0
                     _moe_profile['call_count'] = 0
 

@@ -1,6 +1,6 @@
-# vLLM Apple Plugin - Metal V1.5
+# vLLM Apple Plugin - Metal v2.0
 
-Native Metal backend for vLLM on Apple Silicon with custom PagedAttention kernels.
+Native Metal backend for vLLM on Apple Silicon with MTLBuffer-based engine and custom PagedAttention kernels.
 
 ## Performance
 
@@ -69,6 +69,9 @@ outputs = llm.generate(
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `VLLM_APPLE_USE_ENGINE` | `0` | Enable v2.0 MTLBuffer engine mode |
+| `VLLM_APPLE_ENGINE_PREFILL` | `1`* | Enable engine prefill (*when engine enabled) |
+| `VLLM_METAL_STRICT_NO_MPS` | `0` | Strict mode: reject MPS tensors in engine |
 | `VLLM_METAL_ATTENTION` | `1` | Enable Metal attention backend |
 | `VLLM_METAL_FUSED_KV` | `1` | Enable fused KV-write + attention |
 
