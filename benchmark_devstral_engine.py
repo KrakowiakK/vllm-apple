@@ -11,8 +11,8 @@ to validate assumptions in the BATCH=1 optimization plan.
 """
 import os
 os.environ['VLLM_CPU_KVCACHE_SPACE'] = '4'
-os.environ['VLLM_METAL_SCRATCH_POOL_MB'] = '4096'  # 4GB scratch pool
-os.environ['VLLM_METAL_MAX_BATCH_SIZE'] = '2048'  # Allow larger batches
+os.environ['VLLM_METAL_SCRATCH_POOL_MB'] = '8192'  # 8GB scratch pool for large batches
+os.environ['VLLM_METAL_MAX_BATCH_SIZE'] = '16384'  # Allow very large batches (batch 16 × 1024 tokens)
 
 import time
 import torch

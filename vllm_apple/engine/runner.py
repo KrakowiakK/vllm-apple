@@ -314,7 +314,7 @@ class EngineRunner:
             max_tokens = min(
                 config.max_batch_size,  # Engine config limit
                 self.model_desc.max_position_embeddings,  # Model limit
-                4096,  # Hard cap to prevent huge allocations
+                16384,  # Hard cap - allows batch 16 x 1024 tokens
             )
 
         # Store for bounds checking in execute_step
