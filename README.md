@@ -1,120 +1,99 @@
-# vLLM Apple Plugin - Metal v2.0
+# vLLM Apple Metal Engine v2.0
 
-Native Metal backend for vLLM on Apple Silicon with MTLBuffer-based engine and custom PagedAttention kernels.
+Native Metal backend for vLLM on Apple Silicon. MTLBuffer-based execution engine with custom PagedAttention kernels.
+
+**Status: COMPLETE** - All invariants satisfied, batch scaling 1-16 operational.
 
 ## Performance
 
-Throughput on M3 Ultra with Qwen3-30B-A3B:
+Devstral-Small-2505 (24B) on M3 Ultra (512 GB):
 
-| Batch Size | tok/s | Scaling |
-|------------|-------|---------|
-| 1          | 6.7   | 1.00x   |
-| 2          | 11.3  | 1.70x   |
-| 4          | 16.5  | 2.47x   |
-| 8          | 23.1  | 3.47x   |
-| 16         | 32.8  | 4.92x   |
+| Batch | Decode tok/s | Prefill tok/s | Scaling |
+|-------|-------------|---------------|---------|
+| 1     | 10.9        | 160.4         | 1.00x   |
+| 2     | 21.7        | 234.4         | 1.99x   |
+| 4     | 43.0        | 331.9         | 3.94x   |
+| 8     | 83.4        | 399.8         | 7.65x   |
+| 16    | 124.1       | 450.7         | 11.39x  |
 
-## Architecture
+Near-linear batch scaling (1.79-2.02x per doubling). Batch=1 is compute-bound (GPU: 91.92ms, CPU: 0.31ms).
 
-### Metal Kernels
-
-- **MetalPagedAttentionV2**: Prefill path with batched KV write
-- **MetalPagedAttentionFused**: Decode path with fused KV-write + attention
-- **MetalKVCache**: Unified GPU/CPU memory via MTLBuffer
-
-### Two-Phase Fused Decode
-
-The fused kernel eliminates CPU-side KV update overhead:
-
-1. `kv_write_decode`: Fast kernel writes new K/V to cache
-2. `paged_attention_fused_h128`: Attention reads from populated cache
-
-Both run in same GPU dispatch - no CPU sync between them.
-
-## Installation
+## Quick Start
 
 ```bash
-# Clone repository
-git clone https://github.com/anthropics/vllm-apple.git
-cd vllm-apple
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
+# Install
 pip install -e .
-```
 
-## Usage
+# Run with Metal Engine
+VLLM_APPLE_USE_ENGINE=1 \
+VLLM_APPLE_ENGINE_PREFILL=1 \
+python your_script.py
+```
 
 ```python
 from vllm import LLM, SamplingParams
 
-# Plugin auto-registers via entrypoint
 llm = LLM(
-    model="Qwen/Qwen3-30B-A3B",
+    model="mistralai/Devstral-Small-2505",
     dtype="float16",
     max_model_len=2048,
-    gpu_memory_utilization=0.85,
 )
 
 outputs = llm.generate(
-    ["The capital of France is"],
-    SamplingParams(max_tokens=50, temperature=0.0),
+    ["def fibonacci(n):"],
+    SamplingParams(max_tokens=100, temperature=0.0),
 )
 ```
 
-## Environment Variables
+## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLLM_APPLE_USE_ENGINE` | `0` | Enable v2.0 MTLBuffer engine mode |
-| `VLLM_APPLE_ENGINE_PREFILL` | `1`* | Enable engine prefill (*when engine enabled) |
-| `VLLM_METAL_STRICT_NO_MPS` | `0` | Strict mode: reject MPS tensors in engine |
-| `VLLM_METAL_ATTENTION` | `1` | Enable Metal attention backend |
-| `VLLM_METAL_FUSED_KV` | `1` | Enable fused KV-write + attention |
+| `VLLM_APPLE_USE_ENGINE` | `0` | Enable Metal Engine v2.0 |
+| `VLLM_APPLE_ENGINE_PREFILL` | `1` | Engine prefill (when engine enabled) |
+| `VLLM_METAL_SCRATCH_POOL_MB` | `512` | Scratch pool size for large models |
+| `VLLM_METAL_MAX_BATCH_SIZE` | `256` | Max tokens per step |
+| `VLLM_METAL_STRICT_NO_MPS` | `0` | Strict mode: reject MPS tensors |
 
-## Project Structure
+### Large Models (24B+)
 
+```bash
+# Batch 4
+VLLM_METAL_SCRATCH_POOL_MB=1024 ...
+
+# Batch 8
+VLLM_METAL_SCRATCH_POOL_MB=2048 ...
+
+# Batch 16
+VLLM_METAL_SCRATCH_POOL_MB=4096 \
+VLLM_METAL_MAX_BATCH_SIZE=512 ...
 ```
-vllm_apple/
-    __init__.py              # Plugin entrypoint
-    platform.py              # ApplePlatform implementation
-    metal/
-        __init__.py
-        kv_cache.py          # MetalKVCache with MTLBuffer
-        bridge/
-            __init__.py
-            metal_runtime.py
-            metal_paged_attention_v2.py     # V2 prefill kernel
-            metal_paged_attention_fused.py  # Fused decode kernel
-        kernels/
-            paged_attention_v2.metal        # V2 shader
-            paged_attention_fused.metal     # Fused shader
-    ops/
-        apple_fused_moe.py   # MoE operations
-        metal/
-            moe_kernel_v2.metal
-            moe_metal.py
-    v1/
-        attention/
-            backends/
-                metal_attn.py    # MetalAttentionBackend
-        worker/
-            apple_worker.py
-            apple_model_runner.py
-            apple_input_batch.py
-```
+
+## Project Status
+
+| Component | Status |
+|-----------|--------|
+| Metal Engine v2.0 | COMPLETE |
+| PagedAttention (Prefill) | COMPLETE |
+| PagedAttention (Fused Decode) | COMPLETE |
+| KV Cache (MTLBuffer) | COMPLETE |
+| Batch Scaling 1-16 | COMPLETE |
+| Batch=1 Optimization | CLOSED (compute-bound) |
+| Custom Metal GEMM | PLANNED (not implemented) |
+
+## Documentation
+
+Detailed documentation in `docs/`:
+
+- `METAL_PLAN.md` - Implementation plan and architecture
+- `BENCHMARK_DEVSTRAL_24B.md` - Full benchmark results
+- `ENGINE_ARCHITECTURE_NOTES.md` - Architecture rationale
+- `GEMM_METAL.md` - Future GEMM optimization plan
 
 ## Tests
 
 ```bash
-# Run Metal attention tests
-python -m pytest tests/test_metal_attention.py -v
-
-# Run all tests
-python -m pytest tests/ -v
+pytest tests/ -v
 ```
 
 ## License
