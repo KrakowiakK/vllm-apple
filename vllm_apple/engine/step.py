@@ -111,6 +111,19 @@ class EngineStepContext:
         # Profiling
         self._profiler = get_profiler() if is_profiling_enabled() else None
 
+        # === BATCH=1 DECODE OPTIMIZATION FLAG ===
+        # When True, ops should use pure Metal paths (no MPS) to avoid
+        # encoder transitions. Set by runner when (decode && num_seqs==1).
+        self._decode_single_seq = False
+
+        # === INSTRUMENTATION COUNTERS (Phase 0) ===
+        # Track encoder transitions and barriers to validate diagnosis
+        self._num_mps_transitions = 0       # end_compute_encoder_for_mps calls
+        self._num_encoder_reopens = 0       # get_compute_encoder reopens after MPS
+        self._num_barriers = 0              # memory_barrier calls
+        self._num_barrier_reopens = 0       # barriers that forced encoder reopen
+        self._encoder_was_closed_for_mps = False  # track MPS close state
+
     def __enter__(self) -> "EngineStepContext":
         """Enter step context - starts ENCODE phase."""
         # Start profiling
@@ -139,6 +152,16 @@ class EngineStepContext:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit step context - cleanup resources."""
+        # === INSTRUMENTATION: Print stats for batch=1 decode ===
+        if self.step_kind == "decode" and self.num_seqs == 1:
+            logger.info(
+                f"[BATCH1-STATS] step={self.step_id} "
+                f"MPS_transitions={self._num_mps_transitions} "
+                f"encoder_reopens={self._num_encoder_reopens} "
+                f"barriers={self._num_barriers} "
+                f"barrier_reopens={self._num_barrier_reopens}"
+            )
+
         # Release scratch allocations
         self._release_scratch()
 
@@ -187,6 +210,10 @@ class EngineStepContext:
             self._encoder = self._command_buffer.computeCommandEncoder()
             if self._encoder is None:
                 raise RuntimeError("Failed to re-create compute encoder")
+            # === INSTRUMENTATION: Track encoder reopen after MPS ===
+            if self._encoder_was_closed_for_mps:
+                self._num_encoder_reopens += 1
+                self._encoder_was_closed_for_mps = False
 
         return self._encoder
 
@@ -212,6 +239,9 @@ class EngineStepContext:
         if self._encoder is not None:
             self._encoder.endEncoding()
             self._encoder = None
+            # === INSTRUMENTATION: Track MPS transition ===
+            self._num_mps_transitions += 1
+            self._encoder_was_closed_for_mps = True
 
         return self._command_buffer
 
@@ -229,6 +259,26 @@ class EngineStepContext:
     def is_completed(self) -> bool:
         """Check if execution is complete."""
         return self._is_completed
+
+    @property
+    def decode_single_seq(self) -> bool:
+        """Check if this is a batch=1 decode step.
+
+        When True, ops should prefer pure Metal paths over MPS
+        to minimize encoder transitions.
+        """
+        return self._decode_single_seq
+
+    def set_decode_single_seq(self, value: bool) -> None:
+        """Set batch=1 decode optimization flag.
+
+        This should ONLY be set when:
+            step_kind == "decode" AND num_seqs == 1
+
+        Args:
+            value: True to enable batch=1 optimizations
+        """
+        self._decode_single_seq = value
 
     def allocate_scratch(self, size: int, name: str = "scratch") -> Any:
         """Allocate scratch buffer for this step.
@@ -338,6 +388,12 @@ class EngineStepContext:
         """
         if self._current_phase != EnginePhase.ENCODE:
             raise RuntimeError("memory_barrier only allowed during ENCODE phase")
+
+        # === INSTRUMENTATION: Track barrier calls ===
+        self._num_barriers += 1
+        encoder_was_none = self._encoder is None
+        if encoder_was_none:
+            self._num_barrier_reopens += 1
 
         if HAS_METAL and MTLBarrierScopeBuffers is not None:
             # Re-open encoder if it was closed for MPS

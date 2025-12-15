@@ -111,6 +111,7 @@ class UnifiedGEMM:
 
     def _should_use_metal(
         self,
+        step_ctx: Any,
         M: int,
         K: int,
         N: int,
@@ -118,11 +119,13 @@ class UnifiedGEMM:
         """Determine if Metal backend should be used.
 
         Heuristics for auto mode:
+        - Use Metal for batch=1 decode (avoids MPS encoder transitions)
         - Use Metal for small M (decode phase)
         - Use Metal for very large N (LM head)
         - Use MPS as default (well-optimized by Apple)
 
         Args:
+            step_ctx: EngineStepContext (may have decode_single_seq flag)
             M: Rows of output
             K: Inner dimension
             N: Columns of output
@@ -134,6 +137,13 @@ class UnifiedGEMM:
             return True
         if self._backend == "mps":
             return False
+
+        # === BATCH=1 DECODE OPTIMIZATION ===
+        # When decode_single_seq is True, always use native Metal to avoid
+        # MPS encoder transitions (end/reopen cycle). This is the primary
+        # optimization for batch=1 decode latency.
+        if hasattr(step_ctx, 'decode_single_seq') and step_ctx.decode_single_seq:
+            return True
 
         # Auto mode heuristics
         # Small-M decode: Metal kernel is optimized for this
@@ -191,7 +201,7 @@ class UnifiedGEMM:
         # Choose backend
         use_metal = (
             self._metal_gemm is not None and
-            self._should_use_metal(M, K, N) and
+            self._should_use_metal(step_ctx, M, K, N) and
             alpha == 1.0 and beta == 0.0 and not transpose_A
         )
 

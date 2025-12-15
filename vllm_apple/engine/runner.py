@@ -532,6 +532,11 @@ class EngineRunner:
         ) as step_ctx:
             # === ENCODE PHASE ===
 
+            # Set batch=1 decode optimization flag
+            # This enables pure Metal paths (no MPS) to avoid encoder transitions
+            if step_desc.step_kind == "decode" and step_desc.num_seqs_active == 1:
+                step_ctx.set_decode_single_seq(True)
+
             # Reset scratch generation counter for this step
             # This allows cross-layer scratch buffer reuse
             self._context.reset_scratch_generation()
@@ -682,6 +687,11 @@ class EngineRunner:
 
         # 1. Input LayerNorm
         # Save hidden states as residual, output to residual_buffer
+        # === BATCH=1 DECODE: Reduced barriers ===
+        # For batch=1 decode, we coalesce barriers to reduce overhead.
+        # This is safe because all ops encode to the same command buffer.
+        use_reduced_barriers = step_ctx.decode_single_seq
+
         self._elementwise.encode_copy(
             step_ctx=step_ctx,
             input_buffer=hidden_states,
@@ -695,7 +705,9 @@ class EngineRunner:
             num_tokens=num_tokens,
         )
 
-        step_ctx.memory_barrier()
+        # Barrier after input_norm: Skip for batch=1 decode (coalesce with QKV)
+        if not use_reduced_barriers:
+            step_ctx.memory_barrier()
 
         # 2. QKV Projection
         layer_ops.qkv_proj.encode(
@@ -705,7 +717,9 @@ class EngineRunner:
             num_tokens=num_tokens,
         )
 
-        step_ctx.memory_barrier()
+        # Barrier after QKV: Skip for batch=1 decode (coalesce with RoPE)
+        if not use_reduced_barriers:
+            step_ctx.memory_barrier()
 
         # 3. RoPE on Q and K
         q_size = num_tokens * md.num_attention_heads * md.head_size
@@ -733,6 +747,7 @@ class EngineRunner:
             max_position_in_batch=max_position_in_batch,
         )
 
+        # BARRIER 1: QKV + RoPE complete (always needed before attention)
         step_ctx.memory_barrier()
 
         # 4. Attention (decode-only): fused KV-write + attention
@@ -756,6 +771,7 @@ class EngineRunner:
                 new_values_offset=v_offset_bytes,
             )
 
+            # Barrier between KV write and prefill attention (always needed)
             step_ctx.memory_barrier()
 
             layer_ops.attention.encode_prefill(
@@ -795,6 +811,7 @@ class EngineRunner:
                 output_offset=0,
             )
 
+        # BARRIER 2: Attention complete (always needed before O-proj)
         step_ctx.memory_barrier()
 
         # 5. O Projection + residual add
@@ -814,6 +831,7 @@ class EngineRunner:
             num_elements=num_tokens * md.hidden_size,
         )
 
+        # BARRIER 3: O-proj + residual complete (always needed before post-attn norm)
         step_ctx.memory_barrier()
 
         # 7. Post-attention LayerNorm
@@ -831,7 +849,9 @@ class EngineRunner:
             num_tokens=num_tokens,
         )
 
-        step_ctx.memory_barrier()
+        # Barrier after post-attn norm: Skip for batch=1 decode (coalesce with MLP)
+        if not use_reduced_barriers:
+            step_ctx.memory_barrier()
 
         # 8. MLP
         # Allocate MLP scratch
@@ -846,7 +866,9 @@ class EngineRunner:
             num_tokens=num_tokens,
         )
 
-        step_ctx.memory_barrier()
+        # Barrier after MLP: Skip for batch=1 decode (coalesce with final residual)
+        if not use_reduced_barriers:
+            step_ctx.memory_barrier()
 
         # 9. Final residual add
         self._elementwise.encode_residual_add(
@@ -857,6 +879,7 @@ class EngineRunner:
             num_elements=num_tokens * md.hidden_size,
         )
 
+        # BARRIER 4: Layer complete (always needed before next layer)
         step_ctx.memory_barrier()
 
         return hidden_states, residual_buffer

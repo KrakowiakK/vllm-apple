@@ -214,21 +214,28 @@ class EngineGEMM:
         self._context = context
         self._device = context.device
 
-        # Check if custom Metal backend is requested
+        # Check GEMM backend setting
         backend = os.environ.get("VLLM_GEMM_BACKEND", "auto").lower()
+        self._backend = backend  # Store for later use
         self._use_metal_backend = backend == "metal"
         self._metal_gemm = None
 
-        if self._use_metal_backend:
+        # Initialize Metal backend if requested OR in auto mode (for decode_single_seq)
+        if backend in ("metal", "auto"):
             try:
                 from .gemm_metal import EngineGEMMMetal
                 self._metal_gemm = EngineGEMMMetal(context)
-                logger.info("EngineGEMM initialized with custom Metal backend")
+                if backend == "metal":
+                    logger.info("EngineGEMM initialized with custom Metal backend (forced)")
+                else:
+                    logger.debug("EngineGEMM: Metal backend available for auto selection")
             except Exception as e:
                 logger.warning(f"Failed to initialize Metal GEMM, falling back to MPS: {e}")
                 self._use_metal_backend = False
+                self._metal_gemm = None
 
-        if not self._use_metal_backend:
+        # Always initialize MPS wrapper unless Metal is forced
+        if backend != "metal":
             if not HAS_MPS:
                 raise RuntimeError(
                     "MetalPerformanceShaders not available. "
@@ -350,26 +357,36 @@ class EngineGEMM:
         self._validate_dtype(B, "B")
         self._validate_dtype(C, "C")
 
-        # Delegate to custom Metal backend if enabled
-        if self._use_metal_backend and self._metal_gemm is not None:
-            # Metal backend only supports alpha=1.0, beta=0.0, no transpose_A
-            if alpha == 1.0 and beta == 0.0 and not transpose_A:
-                self._metal_gemm.encode(
-                    step_ctx=step_ctx,
-                    A=A,
-                    B=B,
-                    C=C,
-                    M=M,
-                    K=K,
-                    N=N,
-                    transpose_B=transpose_B,
-                )
-                return
-            # Fall through to MPS for unsupported cases
-            # Lazy init MPS wrapper if needed
-            if not hasattr(self, '_matrix_wrapper'):
-                self._matrix_wrapper = MPSMatrixWrapper(self._context)
-                self._mm_cache = {}
+        # === BATCH=1 DECODE OPTIMIZATION ===
+        # Check if we should use Metal backend for this encode:
+        # 1. Metal backend is available
+        # 2. Either forced (backend="metal") OR step_ctx.decode_single_seq is True
+        # 3. Operation is supported by Metal (alpha=1, beta=0, no transpose_A)
+        use_metal_for_this_call = (
+            self._metal_gemm is not None and
+            (self._use_metal_backend or
+             (hasattr(step_ctx, 'decode_single_seq') and step_ctx.decode_single_seq)) and
+            alpha == 1.0 and beta == 0.0 and not transpose_A
+        )
+
+        if use_metal_for_this_call:
+            self._metal_gemm.encode(
+                step_ctx=step_ctx,
+                A=A,
+                B=B,
+                C=C,
+                M=M,
+                K=K,
+                N=N,
+                transpose_B=transpose_B,
+            )
+            return
+
+        # Fall through to MPS
+        # Lazy init MPS wrapper if needed (when Metal was forced but op not supported)
+        if not hasattr(self, '_matrix_wrapper'):
+            self._matrix_wrapper = MPSMatrixWrapper(self._context)
+            self._mm_cache = {}
 
         # Convert tensors to MPSMatrix
         if isinstance(A, EngineTensor):
