@@ -84,6 +84,7 @@ class ScratchBuffer:
     size: int
     in_use: bool = False
     last_step_id: int = -1
+    last_generation: int = -1  # Generation (layer index) when last used
 
 
 class EngineScratchPool:
@@ -91,6 +92,18 @@ class EngineScratchPool:
 
     Scratch buffers are used for intermediate results during engine execution.
     The pool pre-allocates buffers to avoid allocation overhead in hot path.
+
+    GENERATION-BASED REUSE (v2.1):
+    Scratch buffers can be reused across layers within a step. Each layer:
+    1. Advances the generation counter at layer start
+    2. Allocates scratch buffers (tagged with current generation)
+    3. Releases buffers from that generation at layer end
+
+    This enables cross-layer reuse for MLP intermediates and other
+    layer-local temporaries, dramatically reducing memory requirements.
+
+    IMPORTANT: Buffers are only reused when explicitly released (in_use=False).
+    Generation tracking is for lifetime management, NOT for bypassing in_use.
     """
 
     def __init__(self, device: Any, pool_size_mb: int = 512):
@@ -105,13 +118,25 @@ class EngineScratchPool:
         self._buffers: List[ScratchBuffer] = []
         self._lock = threading.Lock()
         self._allocated_bytes = 0
+        self._current_generation = 0
 
-    def allocate(self, size: int, step_id: int = -1) -> Any:
+        # Stats for debugging
+        self._reuse_hits = 0
+        self._new_allocs = 0
+        self._peak_in_use_bytes = 0
+        self._current_in_use_bytes = 0
+
+    def allocate(self, size: int, step_id: int = -1, generation: int = -1) -> Any:
         """Allocate a scratch buffer of at least the given size.
+
+        SAFETY: Only reuses buffers that are NOT in_use. Generation tracking
+        is for lifetime management (knowing which buffers to release), not
+        for bypassing the in_use flag.
 
         Args:
             size: Minimum buffer size in bytes
             step_id: Current step ID for tracking
+            generation: Current generation (layer index) for lifetime tracking.
 
         Returns:
             MTLBuffer
@@ -120,21 +145,44 @@ class EngineScratchPool:
             RuntimeError: If pool is exhausted
         """
         with self._lock:
-            # First, try to find a suitable free buffer
+            # Use pool's current generation if not specified
+            if generation < 0:
+                generation = self._current_generation
+
+            # Find best-fit buffer that is NOT in use
+            # CRITICAL: Do NOT reuse buffers that are still in_use, even if
+            # from older generation. The GPU may still need them.
+            best_fit = None
+            best_fit_size = float('inf')
+
             for buf in self._buffers:
-                if not buf.in_use and buf.size >= size:
-                    buf.in_use = True
-                    buf.last_step_id = step_id
-                    return buf.buffer
+                if buf.size >= size and not buf.in_use:
+                    if buf.size < best_fit_size:
+                        best_fit = buf
+                        best_fit_size = buf.size
+
+            if best_fit is not None:
+                best_fit.in_use = True
+                best_fit.last_step_id = step_id
+                best_fit.last_generation = generation
+                self._reuse_hits += 1
+                self._current_in_use_bytes += best_fit.size
+                self._peak_in_use_bytes = max(self._peak_in_use_bytes, self._current_in_use_bytes)
+                return best_fit.buffer
 
             # Need to allocate new buffer
             # Round up to 64KB alignment for Metal efficiency
             aligned_size = (size + 65535) & ~65535
 
             if self._allocated_bytes + aligned_size > self.pool_size_bytes:
+                # Provide diagnostic info
+                in_use_count = sum(1 for b in self._buffers if b.in_use)
+                in_use_bytes = sum(b.size for b in self._buffers if b.in_use)
                 raise RuntimeError(
                     f"Scratch pool exhausted: requested {size} bytes, "
-                    f"allocated {self._allocated_bytes}, pool size {self.pool_size_bytes}"
+                    f"allocated {self._allocated_bytes}/{self.pool_size_bytes}, "
+                    f"in_use {in_use_count} buffers ({in_use_bytes} bytes), "
+                    f"generation {generation}, current_gen {self._current_generation}"
                 )
 
             buffer = self.device.newBufferWithLength_options_(
@@ -145,12 +193,41 @@ class EngineScratchPool:
             if buffer is None:
                 raise RuntimeError(f"Failed to allocate scratch buffer of {aligned_size} bytes")
 
-            scratch = ScratchBuffer(buffer=buffer, size=aligned_size, in_use=True, last_step_id=step_id)
+            scratch = ScratchBuffer(
+                buffer=buffer,
+                size=aligned_size,
+                in_use=True,
+                last_step_id=step_id,
+                last_generation=generation,
+            )
             self._buffers.append(scratch)
             self._allocated_bytes += aligned_size
+            self._new_allocs += 1
+            self._current_in_use_bytes += aligned_size
+            self._peak_in_use_bytes = max(self._peak_in_use_bytes, self._current_in_use_bytes)
 
             logger.debug(f"Allocated scratch buffer: {aligned_size} bytes, total: {self._allocated_bytes}")
             return buffer
+
+    def advance_generation(self) -> int:
+        """Advance to the next generation (typically called per layer).
+
+        Returns:
+            The new generation number.
+        """
+        with self._lock:
+            self._current_generation += 1
+            return self._current_generation
+
+    def get_generation(self) -> int:
+        """Get the current generation number."""
+        with self._lock:
+            return self._current_generation
+
+    def reset_generation(self) -> None:
+        """Reset generation counter (typically called at step start)."""
+        with self._lock:
+            self._current_generation = 0
 
     def release(self, buffer: Any) -> None:
         """Release a scratch buffer back to the pool.
@@ -161,6 +238,8 @@ class EngineScratchPool:
         with self._lock:
             for buf in self._buffers:
                 if buf.buffer is buffer:
+                    if buf.in_use:
+                        self._current_in_use_bytes -= buf.size
                     buf.in_use = False
                     return
 
@@ -173,20 +252,82 @@ class EngineScratchPool:
         with self._lock:
             for buf in self._buffers:
                 if buf.in_use and buf.last_step_id == step_id:
+                    self._current_in_use_bytes -= buf.size
                     buf.in_use = False
+
+    def release_generation(self, generation: int) -> int:
+        """Release all buffers from a specific generation.
+
+        Args:
+            generation: Generation whose buffers should be released
+
+        Returns:
+            Number of buffers released
+        """
+        released = 0
+        with self._lock:
+            for buf in self._buffers:
+                if buf.in_use and buf.last_generation == generation:
+                    self._current_in_use_bytes -= buf.size
+                    buf.in_use = False
+                    released += 1
+        return released
+
+    def release_up_to_generation(self, generation: int) -> int:
+        """Release all buffers from generations <= given generation.
+
+        Useful for recovery or cleanup if a generation was skipped.
+
+        Args:
+            generation: Release all buffers with last_generation <= this
+
+        Returns:
+            Number of buffers released
+        """
+        released = 0
+        with self._lock:
+            for buf in self._buffers:
+                if buf.in_use and buf.last_generation <= generation:
+                    self._current_in_use_bytes -= buf.size
+                    buf.in_use = False
+                    released += 1
+        return released
 
     def get_stats(self) -> Dict[str, Any]:
         """Get pool statistics."""
         with self._lock:
             in_use = sum(1 for b in self._buffers if b.in_use)
             in_use_bytes = sum(b.size for b in self._buffers if b.in_use)
+
+            # Per-generation breakdown
+            gen_stats = {}
+            for buf in self._buffers:
+                if buf.in_use:
+                    gen = buf.last_generation
+                    if gen not in gen_stats:
+                        gen_stats[gen] = {"count": 0, "bytes": 0}
+                    gen_stats[gen]["count"] += 1
+                    gen_stats[gen]["bytes"] += buf.size
+
             return {
                 "total_buffers": len(self._buffers),
                 "in_use_buffers": in_use,
                 "allocated_bytes": self._allocated_bytes,
                 "in_use_bytes": in_use_bytes,
                 "pool_size_bytes": self.pool_size_bytes,
+                "current_generation": self._current_generation,
+                "reuse_hits": self._reuse_hits,
+                "new_allocs": self._new_allocs,
+                "peak_in_use_bytes": self._peak_in_use_bytes,
+                "per_generation": gen_stats,
             }
+
+    def reset_stats(self) -> None:
+        """Reset allocation statistics (call at step boundaries)."""
+        with self._lock:
+            self._reuse_hits = 0
+            self._new_allocs = 0
+            self._peak_in_use_bytes = self._current_in_use_bytes
 
 
 class MetalEngineContext:
@@ -329,6 +470,164 @@ class MetalEngineContext:
             raise RuntimeError("Failed to create command buffer")
         return cmd_buffer
 
+    def load_library(
+        self,
+        name: str,
+        source_path: Optional[str] = None,
+        source_code: Optional[str] = None,
+        preprocessor_macros: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Load or compile MTLLibrary, preferring precompiled .metallib.
+
+        Per METAL_PLAN.md section 1.1:
+        - Load precompiled .metallib from package resources when available
+        - Fall back to runtime compilation from .metal source for debug
+        - Resource path override via VLLM_METAL_PATH_RESOURCES
+
+        The priority order is:
+        1. If VLLM_METAL_PATH_RESOURCES is set, compile from source (debug mode)
+        2. Try loading precompiled {name}.metallib
+        3. Fall back to compiling from {name}.metal or provided source
+
+        Args:
+            name: Library name for caching
+            source_path: Path to .metal source file (optional)
+            source_code: Direct source code string (optional)
+            preprocessor_macros: Dict of macro definitions for compilation
+
+        Returns:
+            MTLLibrary
+
+        Raises:
+            RuntimeError: If loading/compilation fails
+        """
+        with self._library_lock:
+            if name in self._libraries:
+                return self._libraries[name]
+
+            library = None
+            loaded_from = None
+
+            # Check if resource path override is set (debug mode)
+            force_source = get_resource_path() is not None
+
+            if not force_source:
+                # Try loading precompiled .metallib first
+                metallib_path = self._resource_path / f"{name}.metallib"
+                if metallib_path.exists():
+                    library = self._load_metallib(metallib_path)
+                    if library is not None:
+                        loaded_from = f"precompiled metallib: {metallib_path}"
+
+            # Fall back to source compilation
+            if library is None:
+                library, loaded_from = self._compile_from_source(
+                    name, source_path, source_code, preprocessor_macros
+                )
+
+            if library is None:
+                raise RuntimeError(f"Failed to load or compile Metal library '{name}'")
+
+            self._libraries[name] = library
+            logger.info(f"Loaded Metal library '{name}' from {loaded_from}")
+            return library
+
+    def _load_metallib(self, path: Path) -> Optional[Any]:
+        """Load a precompiled .metallib file.
+
+        Args:
+            path: Path to .metallib file
+
+        Returns:
+            MTLLibrary or None if loading fails
+        """
+        try:
+            # Create NSURL for the metallib file
+            from Foundation import NSURL
+            url = NSURL.fileURLWithPath_(str(path))
+
+            # Load the library
+            library, error = self._device.newLibraryWithURL_error_(url, None)
+
+            if library is None or error is not None:
+                logger.warning(f"Failed to load metallib {path}: {error}")
+                return None
+
+            return library
+        except Exception as e:
+            logger.warning(f"Exception loading metallib {path}: {e}")
+            return None
+
+    def _compile_from_source(
+        self,
+        name: str,
+        source_path: Optional[str],
+        source_code: Optional[str],
+        preprocessor_macros: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[Any], str]:
+        """Compile MTLLibrary from source.
+
+        Args:
+            name: Library name
+            source_path: Path to .metal source file
+            source_code: Direct source code string
+            preprocessor_macros: Dict of macro definitions
+
+        Returns:
+            Tuple of (MTLLibrary or None, description of source)
+        """
+        # Determine source
+        if source_code is not None:
+            loaded_from = "inline source"
+        elif source_path is not None:
+            path = Path(source_path)
+            if not path.is_absolute():
+                path = self._resource_path / path
+            if not path.exists():
+                raise FileNotFoundError(f"Metal shader not found: {path}")
+            with open(path, "r") as f:
+                source_code = f.read()
+            loaded_from = f"source file: {path}"
+        else:
+            # Try default .metal file
+            metal_path = self._resource_path / f"{name}.metal"
+            if metal_path.exists():
+                with open(metal_path, "r") as f:
+                    source_code = f.read()
+                loaded_from = f"source file: {metal_path}"
+            else:
+                raise FileNotFoundError(
+                    f"No source found for library '{name}': tried {metal_path}"
+                )
+
+        # Create compile options
+        options = MTLCompileOptions.alloc().init()
+
+        # Set preprocessor macros if provided
+        # METAL_PLAN.md: "use MTLCompileOptions.preprocessorMacros for device
+        # capability gating (e.g., BF16/tensor features)"
+        if preprocessor_macros:
+            from Foundation import NSDictionary, NSNumber, NSString
+            macro_dict = {}
+            for key, value in preprocessor_macros.items():
+                if isinstance(value, bool):
+                    macro_dict[key] = NSNumber.numberWithBool_(value)
+                elif isinstance(value, int):
+                    macro_dict[key] = NSNumber.numberWithInt_(value)
+                else:
+                    macro_dict[key] = NSString.stringWithString_(str(value))
+            options.setPreprocessorMacros_(NSDictionary.dictionaryWithDictionary_(macro_dict))
+
+        # Compile
+        library, error = self._device.newLibraryWithSource_options_error_(
+            source_code, options, None
+        )
+
+        if library is None or error is not None:
+            raise RuntimeError(f"Failed to compile Metal shader '{name}': {error}")
+
+        return library, loaded_from
+
     def compile_library(
         self,
         name: str,
@@ -336,6 +635,9 @@ class MetalEngineContext:
         source_code: Optional[str] = None,
     ) -> Any:
         """Compile or get cached MTLLibrary.
+
+        This is a compatibility wrapper for load_library(). New code should
+        use load_library() directly to benefit from precompiled metallib loading.
 
         Args:
             name: Library name for caching
@@ -348,35 +650,7 @@ class MetalEngineContext:
         Raises:
             RuntimeError: If compilation fails
         """
-        with self._library_lock:
-            if name in self._libraries:
-                return self._libraries[name]
-
-            if source_path is not None:
-                path = Path(source_path)
-                if not path.is_absolute():
-                    path = self._resource_path / path
-                if not path.exists():
-                    raise FileNotFoundError(f"Metal shader not found: {path}")
-                with open(path, "r") as f:
-                    source_code = f.read()
-            elif source_code is None:
-                raise ValueError("Either source_path or source_code must be provided")
-
-            # Compile options
-            options = MTLCompileOptions.alloc().init()
-
-            # Compile
-            library, error = self._device.newLibraryWithSource_options_error_(
-                source_code, options, None
-            )
-
-            if library is None or error is not None:
-                raise RuntimeError(f"Failed to compile Metal shader '{name}': {error}")
-
-            self._libraries[name] = library
-            logger.info(f"Compiled Metal library: {name}")
-            return library
+        return self.load_library(name, source_path, source_code)
 
     def get_pipeline(
         self,
@@ -524,6 +798,56 @@ class MetalEngineContext:
             buffer: MTLBuffer to release
         """
         self._scratch_pool.release(buffer)
+
+    def release_scratch_for_step(self, step_id: int) -> None:
+        """Release all scratch buffers used in a specific step.
+
+        Args:
+            step_id: Step ID whose buffers should be released
+        """
+        self._scratch_pool.release_all_from_step(step_id)
+
+    def advance_scratch_generation(self) -> int:
+        """Advance scratch pool generation (call per layer).
+
+        Returns:
+            The new generation number.
+        """
+        return self._scratch_pool.advance_generation()
+
+    def get_scratch_generation(self) -> int:
+        """Get current scratch generation."""
+        return self._scratch_pool.get_generation()
+
+    def reset_scratch_generation(self) -> None:
+        """Reset scratch generation (call at step start)."""
+        self._scratch_pool.reset_generation()
+
+    def release_scratch_generation(self, generation: int) -> int:
+        """Release all scratch buffers from a specific generation.
+
+        Call this at layer scope exit to enable cross-layer buffer reuse.
+
+        Args:
+            generation: Generation (layer index) to release
+
+        Returns:
+            Number of buffers released
+        """
+        return self._scratch_pool.release_generation(generation)
+
+    def release_scratch_up_to_generation(self, generation: int) -> int:
+        """Release all scratch buffers from generations <= given.
+
+        Useful for cleanup or recovery.
+
+        Args:
+            generation: Release all buffers with last_generation <= this
+
+        Returns:
+            Number of buffers released
+        """
+        return self._scratch_pool.release_up_to_generation(generation)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get context statistics.

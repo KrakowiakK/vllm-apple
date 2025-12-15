@@ -14,6 +14,22 @@ Uses Apple's MPSMatrixMultiplication which has an encode-only API:
 This allows GEMM to be encoded without synchronization, maintaining
 the v2.0 "no waits in hot path" invariant.
 
+IMPORTANT ENCODING CONTRACT:
+    MPS operations (like MPSMatrixMultiplication) encode directly to a MTLCommandBuffer,
+    NOT to a MTLComputeEncoder. This means:
+    1. Any open compute encoder MUST be ended before MPS encoding
+    2. After MPS encoding, a new compute encoder must be created for further compute ops
+    3. The step_ctx.end_compute_encoder_for_mps() method handles this transition
+
+    This is an encode-only exception allowed under v2.0 invariants because:
+    - MPS encodeToCommandBuffer is a pure encode operation (no waits)
+    - No hidden synchronization or GPU execution occurs
+
+DTYPE CONTRACT:
+    - MPS backend: Supports FLOAT16 and FLOAT32
+    - Custom Metal backend: FLOAT16 only (hard fail on other dtypes)
+    - EngineTensors validate dtype at creation time
+
 Usage:
     from vllm_apple.engine.ops.gemm import EngineGEMM
 
@@ -145,9 +161,22 @@ class MPSMatrixWrapper:
         # Compute row bytes (ensure 16-byte alignment for Metal)
         row_bytes = cols * tensor.itemsize
         if row_bytes % 16 != 0:
-            # For non-aligned data, we need to handle this
-            # In production, weights should be pre-aligned
-            logger.warning(f"Row bytes {row_bytes} not 16-byte aligned")
+            # Row alignment is required for correctness with MPS
+            # This should only fail for malformed tensors or edge cases
+            # Production weights should always be pre-aligned
+            import os
+            if os.environ.get("VLLM_METAL_STRICT_NO_MPS", "0") == "1":
+                raise ValueError(
+                    f"Row bytes {row_bytes} not 16-byte aligned. "
+                    f"Metal requires 16-byte row alignment for correctness. "
+                    f"Tensor shape: {tensor.shape}, itemsize: {tensor.itemsize}"
+                )
+            # Non-strict mode: allow with warning, MPS may handle padding internally
+            logger.warning(
+                f"Row bytes {row_bytes} not 16-byte aligned. "
+                f"This may cause incorrect results. "
+                f"Enable VLLM_METAL_STRICT_NO_MPS=1 to fail on alignment issues."
+            )
 
         return self.create_matrix(
             buffer=tensor.buffer,
@@ -160,10 +189,11 @@ class MPSMatrixWrapper:
 
 
 class EngineGEMM:
-    """Encode-only GEMM operation using MPSMatrixMultiplication.
+    """Encode-only GEMM operation using MPSMatrixMultiplication or custom Metal.
 
     This op encodes GEMM operations to a command buffer WITHOUT executing.
-    It uses Apple's MPSMatrixMultiplication which provides an encode-only API.
+    By default uses Apple's MPSMatrixMultiplication which provides an encode-only API.
+    When VLLM_GEMM_BACKEND=metal, uses custom Metal kernels optimized for decode.
 
     Supports:
     - C = alpha * A @ B + beta * C
@@ -180,21 +210,56 @@ class EngineGEMM:
         Args:
             context: MetalEngineContext
         """
-        if not HAS_MPS:
-            raise RuntimeError(
-                "MetalPerformanceShaders not available. "
-                "Install with: pip install pyobjc-framework-MetalPerformanceShaders"
-            )
-
+        import os
         self._context = context
         self._device = context.device
-        self._matrix_wrapper = MPSMatrixWrapper(context)
 
-        # Cache for MPSMatrixMultiplication objects
-        # Key: (transpose_A, transpose_B, M, K, N)
-        self._mm_cache: Dict[Tuple, Any] = {}
+        # Check if custom Metal backend is requested
+        backend = os.environ.get("VLLM_GEMM_BACKEND", "auto").lower()
+        self._use_metal_backend = backend == "metal"
+        self._metal_gemm = None
 
-        logger.info("EngineGEMM initialized")
+        if self._use_metal_backend:
+            try:
+                from .gemm_metal import EngineGEMMMetal
+                self._metal_gemm = EngineGEMMMetal(context)
+                logger.info("EngineGEMM initialized with custom Metal backend")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Metal GEMM, falling back to MPS: {e}")
+                self._use_metal_backend = False
+
+        if not self._use_metal_backend:
+            if not HAS_MPS:
+                raise RuntimeError(
+                    "MetalPerformanceShaders not available. "
+                    "Install with: pip install pyobjc-framework-MetalPerformanceShaders"
+                )
+            self._matrix_wrapper = MPSMatrixWrapper(context)
+            # Cache for MPSMatrixMultiplication objects
+            # Key: (transpose_A, transpose_B, M, K, N)
+            self._mm_cache: Dict[Tuple, Any] = {}
+            logger.info("EngineGEMM initialized with MPS backend")
+
+    def _validate_dtype(self, tensor: Union[EngineTensor, Any], name: str) -> None:
+        """Validate tensor dtype.
+
+        MPS backend supports FLOAT16 and FLOAT32.
+        Metal backend (EngineGEMMMetal) validates FP16-only internally.
+
+        Args:
+            tensor: EngineTensor to validate
+            name: Name for error message
+
+        Raises:
+            ValueError: If dtype is unsupported
+        """
+        if isinstance(tensor, EngineTensor):
+            if tensor.dtype not in (EngineDType.FLOAT16, EngineDType.FLOAT32):
+                raise ValueError(
+                    f"EngineGEMM requires FLOAT16 or FLOAT32 tensors. "
+                    f"Tensor '{name}' has dtype {tensor.dtype}."
+                )
+        # For raw MTLBuffers, caller must ensure correct dtype
 
     def _get_mm_kernel(
         self,
@@ -279,6 +344,32 @@ class EngineGEMM:
         """
         if not step_ctx.is_encoding:
             raise RuntimeError("encode() called outside ENCODE phase")
+
+        # Validate dtype for EngineTensors
+        self._validate_dtype(A, "A")
+        self._validate_dtype(B, "B")
+        self._validate_dtype(C, "C")
+
+        # Delegate to custom Metal backend if enabled
+        if self._use_metal_backend and self._metal_gemm is not None:
+            # Metal backend only supports alpha=1.0, beta=0.0, no transpose_A
+            if alpha == 1.0 and beta == 0.0 and not transpose_A:
+                self._metal_gemm.encode(
+                    step_ctx=step_ctx,
+                    A=A,
+                    B=B,
+                    C=C,
+                    M=M,
+                    K=K,
+                    N=N,
+                    transpose_B=transpose_B,
+                )
+                return
+            # Fall through to MPS for unsupported cases
+            # Lazy init MPS wrapper if needed
+            if not hasattr(self, '_matrix_wrapper'):
+                self._matrix_wrapper = MPSMatrixWrapper(self._context)
+                self._mm_cache = {}
 
         # Convert tensors to MPSMatrix
         if isinstance(A, EngineTensor):
@@ -384,8 +475,16 @@ class EngineGEMM:
         K = A.shape[2]
         N = C.shape[2]
 
-        # For now, encode individual GEMMs
-        # TODO: Use MPSMatrixMultiplication batched API
+        # WARNING: Batched GEMM is implemented as a Python loop.
+        # This is a temporary fallback and NOT suitable for hot paths.
+        # TODO: Implement native batched GEMM using MPSMatrixMultiplication batched API
+        if batch_size > 8:
+            logger.warning(
+                f"encode_batched called with batch_size={batch_size}. "
+                f"This uses a Python loop and may be slow. "
+                f"Consider restructuring to avoid batched GEMM in hot paths."
+            )
+
         for i in range(batch_size):
             A_slice = A[i]
             C_slice = C[i]

@@ -50,11 +50,17 @@ logger = init_logger(__name__)
 
 # Try to import Metal
 try:
-    from Metal import MTLResourceStorageModeShared
+    from Metal import (
+        MTLResourceStorageModeShared,
+        MTLResourceStorageModePrivate,
+        NSMakeRange,
+    )
     HAS_METAL = True
 except ImportError:
     HAS_METAL = False
     MTLResourceStorageModeShared = None
+    MTLResourceStorageModePrivate = None
+    NSMakeRange = None
 
 
 @dataclass
@@ -97,15 +103,31 @@ class EngineKVCache:
         self,
         engine_context: Any,  # MetalEngineContext
         descriptor: KVCacheDescriptor,
+        use_private_storage: Optional[bool] = None,
     ):
         """Initialize engine KV cache.
 
         Args:
             engine_context: MetalEngineContext for buffer allocation
             descriptor: KVCacheDescriptor with cache configuration
+            use_private_storage: If True, use MTLStorageModePrivate for KV buffers.
+                If False, use MTLStorageModeShared.
+                If None (default), auto-detect based on engine prefill mode:
+                - Private when engine prefill is enabled (no CPU access needed)
+                - Shared when engine prefill is disabled (sync_from_torch_cache needed)
         """
+        from .config import is_engine_prefill_enabled
+
         self._context = engine_context
         self._desc = descriptor
+
+        # Determine storage mode
+        if use_private_storage is None:
+            # Auto-detect: use Private when engine prefill is enabled (default),
+            # because sync_from_torch_cache is not needed
+            self._use_private_storage = is_engine_prefill_enabled()
+        else:
+            self._use_private_storage = use_private_storage
 
         # Validate descriptor
         descriptor.__post_init__()
@@ -136,20 +158,34 @@ class EngineKVCache:
         # Track block allocation (simple tracking, not full allocator)
         self._allocated_blocks = 0
 
+        storage_mode_str = "private" if self._use_private_storage else "shared"
         logger.info(
             f"EngineKVCache initialized: {descriptor.num_layers} layers, "
-            f"{descriptor.num_blocks} blocks, {descriptor.total_cache_mb:.1f} MB"
+            f"{descriptor.num_blocks} blocks, {descriptor.total_cache_mb:.1f} MB, "
+            f"storage mode: {storage_mode_str}"
         )
 
     def _allocate_buffers(self) -> None:
-        """Allocate MTLBuffers for all layers."""
+        """Allocate MTLBuffers for all layers.
+
+        Uses MTLStorageModePrivate when engine prefill is enabled (GPU-only access),
+        or MTLStorageModeShared when CPU access is needed for sync_from_torch_cache.
+        """
         device = self._context.device
+
+        # Select storage mode based on configuration
+        # METAL_PLAN.md: "Prefer MTLStorageModePrivate for KV cache + intermediates;
+        # use MTLStorageModeShared only for CPU inputs/outputs."
+        if self._use_private_storage:
+            storage_mode = MTLResourceStorageModePrivate
+        else:
+            storage_mode = MTLResourceStorageModeShared
 
         for layer_idx in range(self._desc.num_layers):
             # Allocate key buffer
             key_buffer = device.newBufferWithLength_options_(
                 self._bytes_per_layer,
-                MTLResourceStorageModeShared
+                storage_mode
             )
             if key_buffer is None:
                 raise RuntimeError(f"Failed to allocate key buffer for layer {layer_idx}")
@@ -157,7 +193,7 @@ class EngineKVCache:
             # Allocate value buffer
             value_buffer = device.newBufferWithLength_options_(
                 self._bytes_per_layer,
-                MTLResourceStorageModeShared
+                storage_mode
             )
             if value_buffer is None:
                 raise RuntimeError(f"Failed to allocate value buffer for layer {layer_idx}")
@@ -179,8 +215,6 @@ class EngineKVCache:
         initialization. For a multi-GB KV cache, using bytes() would allocate
         the same amount of CPU memory which is wasteful.
         """
-        from Metal import NSMakeRange
-
         # Create a one-shot command buffer for initialization
         cmd_queue = self._context.command_queue
         cmd_buffer = cmd_queue.commandBuffer()
@@ -232,6 +266,15 @@ class EngineKVCache:
     def strides(self) -> Dict[str, int]:
         """Get strides for Metal kernel navigation."""
         return self._strides
+
+    @property
+    def uses_private_storage(self) -> bool:
+        """Check if KV cache uses MTLStorageModePrivate.
+
+        When True, buffers are GPU-only and require explicit blit copies
+        for any CPU access. This is the preferred mode per METAL_PLAN.md.
+        """
+        return self._use_private_storage
 
     def get_buffers(self, layer_idx: int) -> Tuple[Any, Any]:
         """Get key and value MTLBuffers for a layer.
@@ -525,6 +568,15 @@ class EngineKVCache:
                 "(VLLM_APPLE_ENGINE_PREFILL=1) or disable strict mode."
             )
 
+        # Check if KV cache supports sync (requires Shared storage mode)
+        if self._use_private_storage:
+            raise RuntimeError(
+                "sync_from_torch_cache() is not supported with MTLStorageModePrivate. "
+                "Private storage mode is used when engine prefill is enabled. "
+                "Either disable engine prefill (VLLM_APPLE_ENGINE_PREFILL=0) or "
+                "ensure engine prefill is being used for the prefill step."
+            )
+
         if len(torch_caches) != self._desc.num_layers:
             raise ValueError(
                 f"torch_caches has {len(torch_caches)} layers, "
@@ -637,11 +689,16 @@ class EngineKVCache:
         Returns True if the MTLBuffers use storageModeShared which allows
         CPU access to the buffer memory for copying.
 
+        When using MTLStorageModePrivate (the default with engine prefill),
+        sync is not supported because buffers cannot be directly accessed
+        from CPU. In this case, engine prefill should be used instead.
+
         Returns:
-            True if sync is supported, False otherwise.
+            True if sync is supported (Shared storage), False otherwise (Private storage).
         """
-        # storageModeShared buffers support CPU access
-        return True
+        # Only storageModeShared buffers support direct CPU access
+        # Private storage mode requires explicit blit copies
+        return not self._use_private_storage
 
 
 class EngineKVCachePool:

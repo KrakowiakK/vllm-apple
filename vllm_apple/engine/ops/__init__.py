@@ -37,8 +37,12 @@ __all__ = [
     "KVWriteOp",
     # GEMM and projections
     "EngineGEMM",
+    "EngineGEMMMetal",
+    "UnifiedGEMM",
     "EngineQKVProjection",
     "EngineOProjection",
+    # Top-K logits selection
+    "EngineTopK",
     # Normalization
     "EngineRMSNorm",
     # Elementwise ops
@@ -63,6 +67,15 @@ def __getattr__(name):
     elif name == "EngineGEMM":
         from .gemm import EngineGEMM
         return EngineGEMM
+    elif name == "EngineGEMMMetal":
+        from .gemm_metal import EngineGEMMMetal
+        return EngineGEMMMetal
+    elif name == "UnifiedGEMM":
+        from .gemm_selector import UnifiedGEMM
+        return UnifiedGEMM
+    elif name == "EngineTopK":
+        from .topk import EngineTopK
+        return EngineTopK
     elif name == "EngineQKVProjection":
         from .qkv import EngineQKVProjection
         return EngineQKVProjection

@@ -226,13 +226,19 @@ class EngineOutputs:
 
     Attributes:
         logits: Output logits [num_tokens, vocab_size] or [num_seqs, vocab_size]
+            When topk_indices/topk_values are provided, logits may be reconstructed
+            from top-k values with -inf for non-top-k positions.
         hidden_states: Optional hidden states (for certain use cases)
         sampled_token_ids: Optional pre-sampled token IDs (if GPU sampling)
+        topk_indices: Optional top-k indices [num_tokens, k] (int32)
+        topk_values: Optional top-k values [num_tokens, k] (float16)
     """
 
     logits: torch.Tensor
     hidden_states: Optional[torch.Tensor] = None
     sampled_token_ids: Optional[torch.Tensor] = None
+    topk_indices: Optional[torch.Tensor] = None
+    topk_values: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         """Validate that output tensors are on CPU."""
@@ -346,6 +352,7 @@ class ModelDescriptor:
     rope_theta: float = 10000.0
     max_position_embeddings: int = 8192
     architecture: str = "llama"
+    rms_norm_eps: float = 1e-6  # RMSNorm epsilon (varies by model: 1e-5 for Mistral, 1e-6 for LLaMA)
 
     def __post_init__(self):
         """Validate architecture is supported."""
@@ -418,6 +425,7 @@ class ModelDescriptor:
             rope_theta=getattr(config, "rope_theta", 10000.0),
             max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
             architecture=arch,
+            rms_norm_eps=getattr(config, "rms_norm_eps", 1e-6),
         )
 
     @staticmethod

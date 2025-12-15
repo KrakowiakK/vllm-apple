@@ -37,6 +37,16 @@ Environment Variables:
         (e.g., "50") to enable. When disabled, full logits are returned.
         Default: None (disabled)
 
+    VLLM_METAL_SCRATCH_POOL_MB:
+        Size of the scratch memory pool in MB. Larger models with big
+        intermediate sizes (e.g., 24B+ models) may need larger pools
+        for batch sizes > 2. Default: 512
+
+    VLLM_METAL_MAX_BATCH_SIZE:
+        Maximum tokens per scheduler step. This determines scratch buffer
+        allocation and limits how many tokens can be processed in one step.
+        For batch 16 with ~20 tokens per prompt, need at least 320. Default: 256
+
 Usage:
     from vllm_apple.engine.config import is_engine_mode_enabled, EngineConfig
 
@@ -61,6 +71,8 @@ PROFILE_ENV = "VLLM_METAL_PROFILE"
 CAPTURE_TRACE_ENV = "VLLM_METAL_CAPTURE_NEXT_STEP"
 RESOURCE_PATH_ENV = "VLLM_METAL_PATH_RESOURCES"
 TOPK_LOGITS_ENV = "VLLM_METAL_TOPK_LOGITS"
+SCRATCH_POOL_ENV = "VLLM_METAL_SCRATCH_POOL_MB"
+MAX_BATCH_SIZE_ENV = "VLLM_METAL_MAX_BATCH_SIZE"
 
 
 def is_engine_mode_enabled() -> bool:
@@ -127,6 +139,46 @@ def get_resource_path() -> Optional[str]:
     return os.environ.get(RESOURCE_PATH_ENV)
 
 
+def get_scratch_pool_size_mb() -> int:
+    """Get the scratch pool size in MB from environment variable.
+
+    Returns:
+        Scratch pool size in MB (default 512)
+    """
+    value = os.environ.get(SCRATCH_POOL_ENV)
+    if value is None or value == "":
+        return 512
+    try:
+        size = int(value)
+        if size < 1:
+            logger.warning(f"Invalid {SCRATCH_POOL_ENV} value: {value}, must be >= 1, using 512")
+            return 512
+        return size
+    except ValueError:
+        logger.warning(f"Invalid {SCRATCH_POOL_ENV} value: {value}, ignoring")
+        return 512
+
+
+def get_max_batch_size() -> int:
+    """Get the max batch size (tokens per step) from environment variable.
+
+    Returns:
+        Max batch size (default 256)
+    """
+    value = os.environ.get(MAX_BATCH_SIZE_ENV)
+    if value is None or value == "":
+        return 256
+    try:
+        size = int(value)
+        if size < 1:
+            logger.warning(f"Invalid {MAX_BATCH_SIZE_ENV} value: {value}, must be >= 1, using 256")
+            return 256
+        return size
+    except ValueError:
+        logger.warning(f"Invalid {MAX_BATCH_SIZE_ENV} value: {value}, ignoring")
+        return 256
+
+
 @dataclass
 class EngineConfig:
     """Configuration for Metal engine execution.
@@ -190,6 +242,8 @@ class EngineConfig:
             capture_trace=os.environ.get(CAPTURE_TRACE_ENV, "0") == "1",
             resource_path=get_resource_path(),
             topk_logits=get_topk_logits(),
+            max_batch_size=get_max_batch_size(),
+            scratch_pool_size_mb=get_scratch_pool_size_mb(),
         )
 
     def validate(self) -> None:

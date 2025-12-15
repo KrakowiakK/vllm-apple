@@ -56,6 +56,7 @@ from .ops import (
     PagedAttentionOp,
     KVWriteOp,
 )
+from .ops.topk import EngineTopK
 
 logger = init_logger(__name__)
 
@@ -153,6 +154,7 @@ class EngineRunner:
                 input_norm=EngineRMSNorm(
                     context=self._context,
                     hidden_size=md.hidden_size,
+                    eps=md.rms_norm_eps,
                 ),
                 qkv_proj=EngineQKVProjection(
                     context=self._context,
@@ -193,6 +195,7 @@ class EngineRunner:
                 post_attn_norm=EngineRMSNorm(
                     context=self._context,
                     hidden_size=md.hidden_size,
+                    eps=md.rms_norm_eps,
                 ),
                 mlp=EngineMLP(
                     context=self._context,
@@ -208,6 +211,7 @@ class EngineRunner:
         self._final_norm = EngineRMSNorm(
             context=self._context,
             hidden_size=md.hidden_size,
+            eps=md.rms_norm_eps,
         )
 
         # LM head
@@ -216,6 +220,15 @@ class EngineRunner:
             hidden_size=md.hidden_size,
             vocab_size=md.vocab_size,
         )
+
+        # Top-K logits selection (optional, enabled via VLLM_METAL_TOPK_LOGITS)
+        from .config import get_topk_logits
+        self._topk_k = get_topk_logits()
+        if self._topk_k is not None:
+            self._topk_op = EngineTopK(self._context, k=self._topk_k)
+            logger.info(f"Top-K logits enabled with k={self._topk_k}")
+        else:
+            self._topk_op = None
 
         # Elementwise ops
         self._elementwise = EngineElementwiseOps(self._context)
@@ -325,6 +338,25 @@ class EngineRunner:
             logits_size_bytes, MTLResourceStorageModeShared
         )
 
+        # Top-K buffers (only if Top-K is enabled)
+        if self._topk_op is not None:
+            k = self._topk_k
+            # Indices buffer: [max_tokens, k] int32
+            topk_indices_size = max_tokens * k * 4
+            self._topk_indices_buffer = self._context.device.newBufferWithLength_options_(
+                topk_indices_size, MTLResourceStorageModeShared
+            )
+            # Values buffer: [max_tokens, k] float16
+            topk_values_size = max_tokens * k * element_size
+            self._topk_values_buffer = self._context.device.newBufferWithLength_options_(
+                topk_values_size, MTLResourceStorageModeShared
+            )
+            topk_total = (topk_indices_size + topk_values_size) / 1024
+            logger.info(f"Allocated Top-K buffers: {topk_total:.1f}KB (k={k})")
+        else:
+            self._topk_indices_buffer = None
+            self._topk_values_buffer = None
+
         logger.info(
             f"Allocated scratch buffers for max_tokens={max_tokens}: "
             f"hidden={2 * hidden_size_bytes / 1024 / 1024:.1f}MB, "
@@ -380,7 +412,9 @@ class EngineRunner:
         if num_tokens == 0:
             # Empty step - return empty logits
             return EngineOutputs(
-                logits=torch.empty(0, self.model_desc.vocab_size, dtype=torch.float16)
+                logits=torch.empty(0, self.model_desc.vocab_size, dtype=torch.float16),
+                topk_indices=None,
+                topk_values=None,
             )
 
         # Copy inputs to GPU buffers
@@ -396,6 +430,16 @@ class EngineRunner:
         slot_mapping_buffer = self._copy_to_buffer(slot_mapping_int32, "slot_mapping")
         seq_lens_int32 = inputs.seq_lens.to(torch.int32) if inputs.seq_lens.dtype != torch.int32 else inputs.seq_lens
         seq_lens_buffer = self._copy_to_buffer(seq_lens_int32, "seq_lens")
+
+        # Debug: print inputs
+        import os
+        if self._step_counter <= 2 and os.environ.get('VLLM_ENGINE_DEBUG'):
+            logger.info(
+                f"[DEBUG] Step {self._step_counter} inputs: "
+                f"kind={step_desc.step_kind}, num_tokens={num_tokens}, num_seqs={num_seqs}, "
+                f"token_ids={inputs.token_ids.tolist()}, positions={inputs.positions.tolist()}, "
+                f"seq_lens={inputs.seq_lens.tolist()}"
+            )
 
         # Compute max position for RoPE bounds checking
         max_position_in_batch = int(inputs.positions.max().item()) if num_tokens > 0 else 0
@@ -488,6 +532,10 @@ class EngineRunner:
         ) as step_ctx:
             # === ENCODE PHASE ===
 
+            # Reset scratch generation counter for this step
+            # This allows cross-layer scratch buffer reuse
+            self._context.reset_scratch_generation()
+
             # Embedding lookup
             self._embedding.encode(
                 step_ctx=step_ctx,
@@ -504,26 +552,29 @@ class EngineRunner:
             step_ctx.memory_barrier()
 
             # Process each transformer layer
+            # Each layer's scratch allocations are scoped so buffers can be
+            # reused across layers (generation-based reuse)
             for layer_idx, layer_ops in enumerate(self._layers):
-                # Process transformer layer
-                current_hidden, other_hidden = self._encode_transformer_layer(
-                    step_ctx=step_ctx,
-                    layer_idx=layer_idx,
-                    layer_ops=layer_ops,
-                    hidden_states=current_hidden,
-                    residual_buffer=other_hidden,
-                    positions_buffer=positions_buffer,
-                    block_table_buffer=block_table_buffer,
-                    slot_mapping_buffer=slot_mapping_buffer,
-                    seq_lens_buffer=seq_lens_buffer,
-                    token_to_seq_buffer=token_to_seq_buffer,
-                    num_tokens=num_tokens,
-                    num_seqs=step_desc.num_seqs_active,
-                    step_desc=step_desc,
-                    max_position_in_batch=max_position_in_batch,
-                    max_seq_len=max_seq_len,
-                    max_blocks_per_seq=max_blocks_per_seq,
-                )
+                with step_ctx.layer_scope(layer_idx):
+                    # Process transformer layer
+                    current_hidden, other_hidden = self._encode_transformer_layer(
+                        step_ctx=step_ctx,
+                        layer_idx=layer_idx,
+                        layer_ops=layer_ops,
+                        hidden_states=current_hidden,
+                        residual_buffer=other_hidden,
+                        positions_buffer=positions_buffer,
+                        block_table_buffer=block_table_buffer,
+                        slot_mapping_buffer=slot_mapping_buffer,
+                        seq_lens_buffer=seq_lens_buffer,
+                        token_to_seq_buffer=token_to_seq_buffer,
+                        num_tokens=num_tokens,
+                        num_seqs=step_desc.num_seqs_active,
+                        step_desc=step_desc,
+                        max_position_in_batch=max_position_in_batch,
+                        max_seq_len=max_seq_len,
+                        max_blocks_per_seq=max_blocks_per_seq,
+                    )
 
             # Final norm
             self._final_norm.encode(
@@ -544,16 +595,40 @@ class EngineRunner:
                 num_tokens=num_tokens,
             )
 
+            # Top-K selection (optional, reduces GPU-to-CPU transfer by ~800x)
+            if self._topk_op is not None:
+                step_ctx.memory_barrier()
+                self._topk_op.encode(
+                    step_ctx=step_ctx,
+                    logits=self._logits_buffer,
+                    indices_out=self._topk_indices_buffer,
+                    values_out=self._topk_values_buffer,
+                    num_tokens=num_tokens,
+                    vocab_size=self.model_desc.vocab_size,
+                )
+
             # === SUBMIT AND WAIT ===
             step_ctx.end_encoding()
             step_ctx.submit()
             step_ctx.wait_until_completed()
 
             # === READBACK PHASE ===
-            logits = self._readback_logits(num_tokens)
+            if self._topk_op is not None:
+                logits, topk_indices, topk_values = self._readback_topk_logits(num_tokens)
+            else:
+                logits = self._readback_logits(num_tokens)
+                topk_indices = None
+                topk_values = None
             step_ctx.readback_complete()
 
-        return EngineOutputs(logits=logits)
+            # Release scratch buffers used in this step
+            self._context.release_scratch_for_step(step_desc.step_id)
+
+        return EngineOutputs(
+            logits=logits,
+            topk_indices=topk_indices,
+            topk_values=topk_values,
+        )
 
     def _encode_transformer_layer(
         self,
@@ -838,9 +913,75 @@ class EngineRunner:
         buffer_view = self._logits_buffer.contents().as_buffer(size_bytes)
         np_array = np.frombuffer(buffer_view, dtype=np.float16).reshape(num_tokens, vocab_size).copy()
 
+        # Debug: print logits stats
+        if self._step_counter <= 2:
+            import os
+            if os.environ.get('VLLM_ENGINE_DEBUG'):
+                logger.info(
+                    f"[DEBUG] Logits stats (step {self._step_counter}): "
+                    f"shape={np_array.shape}, min={np_array.min():.4f}, max={np_array.max():.4f}, "
+                    f"mean={np_array.mean():.4f}, std={np_array.std():.4f}, "
+                    f"nan_count={np.isnan(np_array).sum()}, inf_count={np.isinf(np_array).sum()}"
+                )
+                # Show top-5 tokens for LAST position (used in prefill)
+                last_row = np_array[-1]
+                top5_idx = np.argsort(last_row)[-5:][::-1]
+                top5_vals = last_row[top5_idx]
+                logger.info(f"[DEBUG] Top-5 tokens (last pos, idx {num_tokens-1}): {list(zip(top5_idx.tolist(), top5_vals.tolist()))}")
+                # Also show first position for reference
+                if num_tokens > 1:
+                    first_row = np_array[0]
+                    top5_idx_first = np.argsort(first_row)[-5:][::-1]
+                    top5_vals_first = first_row[top5_idx_first]
+                    logger.info(f"[DEBUG] Top-5 tokens (first pos, idx 0): {list(zip(top5_idx_first.tolist(), top5_vals_first.tolist()))}")
+
         # Convert to torch
         logits = torch.from_numpy(np_array)
         return logits
+
+    def _readback_topk_logits(
+        self, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read top-k logits from GPU buffers and reconstruct full logits.
+
+        This method reads only the top-k indices and values (~300 bytes per token
+        for k=50) instead of full logits (~256KB per token for 128K vocab),
+        achieving ~800x reduction in GPU-to-CPU data transfer.
+
+        Args:
+            num_tokens: Number of tokens
+
+        Returns:
+            Tuple of:
+                - logits: Full logits tensor [num_tokens, vocab_size] with -inf for non-top-k
+                - topk_indices: Top-k indices [num_tokens, k] (int32)
+                - topk_values: Top-k values [num_tokens, k] (float16)
+        """
+        k = self._topk_k
+        vocab_size = self.model_desc.vocab_size
+
+        # Read top-k indices (int32)
+        indices_size_bytes = num_tokens * k * 4
+        indices_view = self._topk_indices_buffer.contents().as_buffer(indices_size_bytes)
+        indices_np = np.frombuffer(indices_view, dtype=np.int32).reshape(num_tokens, k).copy()
+
+        # Read top-k values (float16)
+        values_size_bytes = num_tokens * k * 2
+        values_view = self._topk_values_buffer.contents().as_buffer(values_size_bytes)
+        values_np = np.frombuffer(values_view, dtype=np.float16).reshape(num_tokens, k).copy()
+
+        # Reconstruct full logits with -inf for non-top-k positions
+        # This preserves API compatibility while still benefiting from reduced transfer
+        logits_np = np.full((num_tokens, vocab_size), -np.inf, dtype=np.float16)
+        for i in range(num_tokens):
+            logits_np[i, indices_np[i]] = values_np[i]
+
+        # Convert to torch tensors
+        logits = torch.from_numpy(logits_np)
+        topk_indices = torch.from_numpy(indices_np)
+        topk_values = torch.from_numpy(values_np)
+
+        return logits, topk_indices, topk_values
 
     def get_stats(self) -> Dict[str, Any]:
         """Get runner statistics."""

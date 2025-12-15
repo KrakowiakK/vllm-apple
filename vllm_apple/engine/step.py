@@ -421,6 +421,50 @@ class EngineStepContext:
         if self._profiler:
             self._profiler.mark_readback_complete()
 
+    @contextmanager
+    def layer_scope(self, layer_idx: int = -1):
+        """Context manager for layer-scoped scratch allocation.
+
+        Scratch buffers allocated inside this scope are tagged with a
+        generation number (layer index). At scope exit, all buffers from
+        this generation are released, making them available for reuse
+        by the next layer.
+
+        This enables cross-layer buffer reuse, dramatically reducing
+        memory requirements for large models (e.g., Devstral 24B MLP
+        intermediates can be reused across all 56 layers instead of
+        allocating 56x the memory).
+
+        Usage:
+            for layer_idx, layer_ops in enumerate(layers):
+                with step_ctx.layer_scope(layer_idx):
+                    # All scratch allocated here is tagged with generation
+                    qkv_buffer = step_ctx.allocate_scratch(...)
+                    mlp_buffer = step_ctx.allocate_scratch(...)
+                    # encode operations...
+                # At scope exit, buffers are RELEASED and can be reused
+
+        Args:
+            layer_idx: Layer index for this scope (for debugging).
+                      Generation is auto-incremented regardless.
+
+        Yields:
+            Current generation number
+        """
+        if self._current_phase != EnginePhase.ENCODE:
+            raise RuntimeError("layer_scope only allowed during ENCODE phase")
+
+        # Advance generation at scope entry
+        generation = self._context.advance_scratch_generation()
+
+        try:
+            yield generation
+        finally:
+            # CRITICAL: Release all buffers from this generation at scope exit.
+            # This makes them available for reuse by the next layer.
+            # Without this release, we'd accumulate memory across all layers.
+            self._context.release_scratch_generation(generation)
+
 
 @contextmanager
 def step_execution(
