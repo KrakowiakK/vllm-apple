@@ -140,12 +140,18 @@ class ApplePlatform(Platform):
                     f"Supported: {sorted(supported_head_sizes)}. Falling back to Apple backend."
                 )
                 use_metal = False
-            elif dtype != torch.float16:
+            elif dtype not in (torch.float16, torch.bfloat16):
                 logger.warning(
-                    f"Metal attention backend requires float16, got {dtype}. "
+                    f"Metal attention backend requires float16 or bfloat16, got {dtype}. "
                     "Falling back to Apple backend."
                 )
                 use_metal = False
+            elif dtype == torch.bfloat16:
+                # bfloat16 models are supported - Metal kernels will convert internally
+                logger.info(
+                    f"Metal attention backend: bfloat16 model detected. "
+                    "Activations will be converted to float16 for Metal kernels."
+                )
 
         if use_metal:
             logger.info(

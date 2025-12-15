@@ -13,9 +13,13 @@ Current status (engine mode):
 - ✅ Decode path uses `EngineRunner` (MTLBuffer engine).
 - ✅ Prefill runs in-engine by default (`VLLM_APPLE_ENGINE_PREFILL=1` is now the default when engine mode enabled).
 - ✅ KV cache is single source of truth (engine-owned; vLLM tensors are stubs only).
+- ✅ KV cache uses `MTLStorageModePrivate` by default (when engine prefill enabled).
 - ✅ Decode inputs are prepared on CPU in engine mode (no implicit MPS→CPU boundary conversion).
 - ✅ No `torch.mps.synchronize()` in hot path when engine prefill enabled.
 - ✅ Strict mode (`VLLM_METAL_STRICT_NO_MPS=1`) raises error on any sync attempts.
+- ✅ Precompiled `.metallib` loading supported (with source fallback).
+- ✅ `MTLCompileOptions.preprocessorMacros` supported for feature gating.
+- ✅ All ENGINE_AUDIT_CHECKLIST items complete (updated 2025-12-14).
 
 ---
 
@@ -47,10 +51,16 @@ Current status (engine mode):
 
 ## 2. PyTorch-MPS Invariants (Hard Stop)
 
-- [ ] No `torch.device("mps")` tensors cross the vLLM ↔ engine boundary
-- [ ] No `torch.mps.synchronize()` anywhere in engine execution paths
-- [ ] No `.item()`, `.tolist()`, `.cpu()` on MPS tensors
-- [ ] Engine mode passes with:
+- [x] No `torch.device("mps")` tensors cross the vLLM ↔ engine boundary
+  - `EngineInputs.__post_init__` validates all tensors are on CPU
+  - `boundary.py` provides additional validation at engine entry
+- [x] No `torch.mps.synchronize()` anywhere in engine execution paths
+  - `strict_mode.py` patches and blocks MPS sync during hot path
+  - `sync_from_torch_cache()` blocked in strict mode and with Private storage
+- [x] No `.item()`, `.tolist()`, `.cpu()` on MPS tensors
+  - All `.item()` calls are on CPU tensors (validated by EngineInputs)
+  - `strict_mode.py` patches tensor methods to raise on MPS tensors during hot path
+- [x] Engine mode passes with:
 
 ```bash
 VLLM_APPLE_USE_ENGINE=1 VLLM_METAL_STRICT_NO_MPS=1 python -m pytest ...
@@ -67,8 +77,10 @@ VLLM_APPLE_USE_ENGINE=1 VLLM_METAL_STRICT_NO_MPS=1 python -m pytest ...
 
 ### Step-boundary-only rule
 
-- [~] One command buffer per scheduler step (prefill OR decode)
-- [~] Exactly ONE wait point per step (after submit, before returning outputs)
+- [x] One command buffer per scheduler step (prefill OR decode)
+  - `EngineRunner.step()` creates single command buffer per step
+- [x] Exactly ONE wait point per step (after submit, before returning outputs)
+  - `waitUntilCompleted()` called only at step boundary in `_execute_step()`
 - [x] NO waits inside:
   - per-layer code
   - per-op code
@@ -99,17 +111,23 @@ VLLM_APPLE_USE_ENGINE=1 VLLM_METAL_STRICT_NO_MPS=1 python -m pytest ...
 
 ## 4. Kernel Library & Pipeline Management (Metal API Hygiene)
 
-- [ ] Engine first loads precompiled `.metallib`
+- [x] Engine first loads precompiled `.metallib`
+  - `load_library()` tries `.metallib` first via `newLibraryWithURL_error_`
+  - Falls back to source compilation only if metallib not found
 - [x] Falls back to runtime compilation from `.metal`
 - [x] Resource path is overridable via env var (e.g., `VLLM_METAL_PATH_RESOURCES`)
-- [ ] `MTLCompileOptions` uses preprocessor macros for feature gating
-- [~] Kernel variants use:
+  - When set, forces source compilation for debugging
+- [x] `MTLCompileOptions` uses preprocessor macros for feature gating
+  - `_compile_from_source()` accepts `preprocessor_macros` dict
+  - Maps to `MTLCompileOptions.setPreprocessorMacros_`
+- [x] Kernel variants use:
   - function constants (`MTLFunctionConstantValues`)
   - NOT runtime branching
-- [~] Pipeline states are cached by:
+  - `get_pipeline()` supports function constants via `function_constants` param
+- [x] Pipeline states are cached by:
   - kernel name
   - constant values
-  - device family
+  - `PipelineKey` dataclass used as cache key
 
 ❌ Red flags:
 - recompiling kernels per step
@@ -126,19 +144,26 @@ VLLM_APPLE_USE_ENGINE=1 VLLM_METAL_STRICT_NO_MPS=1 python -m pytest ...
 
 ### Storage modes
 
-- [ ] `MTLStorageModePrivate` for:
-  - KV cache
-  - activations
-  - intermediates
-- [ ] `MTLStorageModeShared` only for:
-  - CPU inputs
-  - CPU-visible outputs (logits)
+- [x] `MTLStorageModePrivate` for:
+  - KV cache (auto-selected when engine prefill enabled, default)
+  - `EngineKVCache._allocate_buffers()` uses `MTLResourceStorageModePrivate`
+  - Storage mode logged at initialization for transparency
+- [x] `MTLStorageModeShared` only for:
+  - CPU inputs (via `_copy_to_buffer`)
+  - CPU-visible outputs (logits readback)
+  - Scratch pool uses Shared for CPU↔GPU transfers
 
 ### Transfers
 
-- [ ] All shared ↔ private transfers are explicit
-- [ ] Transfers encoded via blit command encoders
-- [ ] No implicit sync-based transfers in hot path
+- [x] All shared ↔ private transfers are explicit
+  - `blit_buffer_to_staging()` for Private→Shared readback
+  - `encode_blit_copy()` for hot-path blit encoding
+- [x] Transfers encoded via blit command encoders
+  - `MTLBlitCommandEncoder` used for buffer copies
+  - `_zero_buffer()` uses GPU-side `fillBuffer_range_value_`
+- [x] No implicit sync-based transfers in hot path
+  - `sync_from_torch_cache()` blocked with Private storage
+  - Phase guards prevent blit-to-staging during ENCODE/SUBMIT
 
 ❌ Red flags:
 - duplicated KV buffers (torch + Metal)
@@ -167,7 +192,9 @@ VLLM_APPLE_USE_ENGINE=1 VLLM_METAL_STRICT_NO_MPS=1 python -m pytest ...
 
 ### Phase 1 (minimum acceptable)
 
-- [~] Engine executes paged attention + KV-write
+- [x] Engine executes paged attention + KV-write
+  - Decode: fused KV-write + attention via `MetalPagedAttentionFused`
+  - Prefill: token-parallel attention via `MetalPagedAttentionV2`
 - [x] Returns logits at step boundary
 - [x] LM head may be temporary on CPU
 

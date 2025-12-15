@@ -130,13 +130,16 @@ class MetalAttentionBackend(AttentionBackend):
     """
 
     accept_output_buffer: bool = True
+    # Metal kernels use float16 internally, but we accept bfloat16 models
+    # and convert activations to float16 before Metal kernel calls
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
+        torch.bfloat16,  # Converted to float16 internally
     ]
 
     @classmethod
     def get_supported_dtypes(cls) -> list[torch.dtype]:
-        return [torch.float16]
+        return [torch.float16, torch.bfloat16]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -603,6 +606,19 @@ class MetalAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             return output
 
+        # BFLOAT16 → FLOAT16 CONVERSION
+        # Metal kernels use half (float16) internally. For bfloat16 models,
+        # we convert activations to float16 before Metal operations.
+        original_dtype = query.dtype
+        original_output = output
+        needs_dtype_conversion = original_dtype == torch.bfloat16
+        if needs_dtype_conversion:
+            query = query.to(torch.float16)
+            key = key.to(torch.float16)
+            value = value.to(torch.float16)
+            # Create float16 output buffer for Metal - will copy back after
+            output = torch.empty_like(output, dtype=torch.float16)
+
         # KV SHARING SAFETY CHECKS
         # When this layer shares KV cache with another layer, we:
         # 1. Don't update KV cache (target layer handles it)
@@ -621,7 +637,7 @@ class MetalAttentionImpl(AttentionImpl):
 
         # Handle encoder attention - no KV cache
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            return self._compute_attention_no_cache(
+            result = self._compute_attention_no_cache(
                 query[:num_actual_tokens],
                 key[:num_actual_tokens],
                 value[:num_actual_tokens],
@@ -629,6 +645,11 @@ class MetalAttentionImpl(AttentionImpl):
                 attn_metadata,
                 is_causal=False,
             )
+            # Convert back if bfloat16 model
+            if needs_dtype_conversion:
+                original_output[:num_actual_tokens].copy_(result.to(original_dtype))
+                return original_output
+            return result
 
         # Initialize MetalKVCache if needed (lazy init with correct sizing)
         # vLLM kv_cache shape: [2, num_blocks, block_size, num_kv_heads, head_size]
@@ -733,6 +754,12 @@ class MetalAttentionImpl(AttentionImpl):
         if _metal_profile_enabled:
             _metal_profile_data['total_forward_ms'] += (time.perf_counter() - _t_forward_start) * 1000
             _metal_profile_data['call_count'] += 1
+
+        # FLOAT16 → BFLOAT16 CONVERSION (if needed)
+        # Copy float16 results back to original bfloat16 output buffer
+        if needs_dtype_conversion:
+            original_output.copy_(output.to(original_dtype))
+            return original_output
 
         return output
 

@@ -219,17 +219,18 @@ def run_prefill_benchmark(
         head_size=config.head_size,
         block_size=config.block_size,
         scale=1.0 / (config.head_size ** 0.5),
-        layer_idx=0,
+        max_num_blocks=num_blocks,
+        max_batch_size=batch_size + 4,
     )
 
-    # Create test tensors (prefill = all tokens at once)
-    query = torch.randn(num_tokens, config.num_query_heads, config.head_size, dtype=torch.float16)
-    key = torch.randn(num_tokens, config.num_kv_heads, config.head_size, dtype=torch.float16)
-    value = torch.randn(num_tokens, config.num_kv_heads, config.head_size, dtype=torch.float16)
+    # Create test tensors for prefill (one query per sequence for attention)
+    # For prefill benchmark, we test attention computation with populated cache
+    query = torch.randn(batch_size, config.num_query_heads, config.head_size, dtype=torch.float16)
     output = torch.zeros_like(query)
 
-    # Query start locations (cumulative token counts)
-    query_start_locs = torch.arange(0, batch_size + 1, dtype=torch.int32) * prompt_len
+    # Create KV cache tensors with proper shape [num_blocks, num_kv_heads, block_size, head_size]
+    key_cache = torch.randn(num_blocks, config.num_kv_heads, config.block_size, config.head_size, dtype=torch.float16)
+    value_cache = torch.randn(num_blocks, config.num_kv_heads, config.block_size, config.head_size, dtype=torch.float16)
 
     # Block table
     max_blocks = min(blocks_per_seq + 2, 64)
@@ -238,22 +239,17 @@ def run_prefill_benchmark(
         for j in range(min(blocks_per_seq, max_blocks)):
             block_table[i, j] = i * blocks_per_seq + j
 
-    # Context lens (full prompt for each)
-    context_lens = torch.full((batch_size,), prompt_len, dtype=torch.int32)
-
-    key_buffer, value_buffer = cache.get_buffers(0)
+    # Sequence lengths (full prompt for each)
+    seq_lens = torch.full((batch_size,), prompt_len, dtype=torch.int32)
 
     # Warmup
     for _ in range(warmup_iterations):
         kernel.forward(
             query=query,
-            key=key,
-            value=value,
-            key_cache=key_buffer,
-            value_cache=value_buffer,
+            key_cache=key_cache,
+            value_cache=value_cache,
             block_table=block_table,
-            context_lens=context_lens,
-            query_start_locs=query_start_locs,
+            seq_lens=seq_lens,
             output=output,
         )
 
@@ -262,13 +258,10 @@ def run_prefill_benchmark(
     for _ in range(num_iterations):
         kernel.forward(
             query=query,
-            key=key,
-            value=value,
-            key_cache=key_buffer,
-            value_cache=value_buffer,
+            key_cache=key_cache,
+            value_cache=value_cache,
             block_table=block_table,
-            context_lens=context_lens,
-            query_start_locs=query_start_locs,
+            seq_lens=seq_lens,
             output=output,
         )
     end_time = time.perf_counter()

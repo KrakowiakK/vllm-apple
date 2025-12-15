@@ -47,7 +47,7 @@ Usage:
     )
 """
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
@@ -220,6 +220,23 @@ class EngineGEMM:
         self._use_metal_backend = backend == "metal"
         self._metal_gemm = None
 
+        # GEMM instrumentation for debugging batch=1 regression
+        self._gemm_debug = os.environ.get("VLLM_GEMM_DEBUG", "0") == "1"
+        self._gemm_calls = []  # List of (M, K, N, backend) for debugging
+
+        # === SIZE-BASED THRESHOLDS FOR METAL VS MPS ===
+        # Metal kernels are NOT competitive with MPS for large matrices.
+        # MPS encoder transition overhead (~0.1-0.2ms) is smaller than the
+        # performance gap between Metal and MPS for large K or N.
+        #
+        # Conservative thresholds based on Devstral (hidden=5120, intermediate=14336):
+        # - K > 2048: MPS is faster (e.g., down_proj K=14336)
+        # - N > 4096: MPS is faster (e.g., gate/up N=14336, LM head N=131072)
+        #
+        # Only use Metal when BOTH K and N are small enough for Metal to be competitive.
+        self._metal_k_threshold = int(os.environ.get("VLLM_METAL_GEMM_K_THRESH", "2048"))
+        self._metal_n_threshold = int(os.environ.get("VLLM_METAL_GEMM_N_THRESH", "4096"))
+
         # Initialize Metal backend if requested OR in auto mode (for decode_single_seq)
         if backend in ("metal", "auto"):
             try:
@@ -357,19 +374,50 @@ class EngineGEMM:
         self._validate_dtype(B, "B")
         self._validate_dtype(C, "C")
 
-        # === BATCH=1 DECODE OPTIMIZATION ===
+        # Infer dimensions early for backend selection and logging
+        if isinstance(A, EngineTensor) and M is None:
+            M = A.shape[0]
+        if isinstance(A, EngineTensor) and K is None:
+            K = A.shape[1]
+        if isinstance(B, EngineTensor) and N is None:
+            if transpose_B:
+                N = B.shape[0]
+            else:
+                N = B.shape[1]
+
+        # === BATCH=1 DECODE OPTIMIZATION WITH SIZE-BASED THRESHOLDS ===
         # Check if we should use Metal backend for this encode:
         # 1. Metal backend is available
         # 2. Either forced (backend="metal") OR step_ctx.decode_single_seq is True
         # 3. Operation is supported by Metal (alpha=1, beta=0, no transpose_A)
+        # 4. Matrix size is small enough for Metal to be competitive with MPS
+        #
+        # CRITICAL: For large K or N, MPS is faster than Metal kernels.
+        # The encoder transition overhead is smaller than Metal's performance gap.
+        is_decode_single_seq = hasattr(step_ctx, 'decode_single_seq') and step_ctx.decode_single_seq
+        operation_supported = alpha == 1.0 and beta == 0.0 and not transpose_A
+
+        # Size-based selection for decode_single_seq path
+        # Only use Metal when K and N are both small enough
+        size_ok_for_metal = (
+            K is not None and N is not None and
+            K <= self._metal_k_threshold and
+            N <= self._metal_n_threshold
+        )
+
         use_metal_for_this_call = (
             self._metal_gemm is not None and
-            (self._use_metal_backend or
-             (hasattr(step_ctx, 'decode_single_seq') and step_ctx.decode_single_seq)) and
-            alpha == 1.0 and beta == 0.0 and not transpose_A
+            operation_supported and
+            (self._use_metal_backend or  # Forced Metal always uses Metal
+             (is_decode_single_seq and size_ok_for_metal))  # Auto: only for small matrices
         )
 
         if use_metal_for_this_call:
+            # Track for debugging
+            if self._gemm_debug:
+                self._gemm_calls.append((M, K, N, "metal"))
+                logger.debug(f"[GEMM] M={M}, K={K}, N={N} -> METAL")
+
             self._metal_gemm.encode(
                 step_ctx=step_ctx,
                 A=A,
@@ -381,6 +429,11 @@ class EngineGEMM:
                 transpose_B=transpose_B,
             )
             return
+
+        # Track MPS path for debugging
+        if self._gemm_debug:
+            self._gemm_calls.append((M, K, N, "mps"))
+            logger.debug(f"[GEMM] M={M}, K={K}, N={N} -> MPS")
 
         # Fall through to MPS
         # Lazy init MPS wrapper if needed (when Metal was forced but op not supported)
@@ -518,6 +571,25 @@ class EngineGEMM:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get operation statistics."""
-        return {
-            "cached_kernels": len(self._mm_cache),
+        stats = {
+            "cached_kernels": len(self._mm_cache) if hasattr(self, '_mm_cache') else 0,
         }
+        if self._gemm_calls:
+            metal_count = sum(1 for _, _, _, b in self._gemm_calls if b == "metal")
+            mps_count = sum(1 for _, _, _, b in self._gemm_calls if b == "mps")
+            stats["gemm_calls_metal"] = metal_count
+            stats["gemm_calls_mps"] = mps_count
+            stats["gemm_calls_total"] = len(self._gemm_calls)
+        return stats
+
+    def get_gemm_log(self) -> List[tuple]:
+        """Get detailed GEMM call log for debugging.
+
+        Returns:
+            List of (M, K, N, backend) tuples
+        """
+        return self._gemm_calls.copy()
+
+    def clear_gemm_log(self) -> None:
+        """Clear the GEMM call log."""
+        self._gemm_calls.clear()

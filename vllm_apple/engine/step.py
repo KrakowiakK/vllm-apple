@@ -26,10 +26,11 @@ Usage:
         results = step.readback()
 """
 
+import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable
-import time
 
 from vllm.logger import init_logger
 from .guards import EngineHotPathGuard, EnginePhase
@@ -122,7 +123,14 @@ class EngineStepContext:
         self._num_encoder_reopens = 0       # get_compute_encoder reopens after MPS
         self._num_barriers = 0              # memory_barrier calls
         self._num_barrier_reopens = 0       # barriers that forced encoder reopen
+        self._num_dispatches = 0            # Metal dispatch calls
         self._encoder_was_closed_for_mps = False  # track MPS close state
+
+        # === TIMING INSTRUMENTATION (Phase 0 profiling) ===
+        self._profile_enabled = os.environ.get("VLLM_PROFILE_BATCH1") == "1"
+        self._transition_time_ns = 0        # Total time in MPS transitions
+        self._barrier_time_ns = 0           # Total time in barriers
+        self._profile_data = {}             # Per-section timing data
 
     def __enter__(self) -> "EngineStepContext":
         """Enter step context - starts ENCODE phase."""
@@ -154,13 +162,22 @@ class EngineStepContext:
         """Exit step context - cleanup resources."""
         # === INSTRUMENTATION: Print stats for batch=1 decode ===
         if self.step_kind == "decode" and self.num_seqs == 1:
+            transition_ms = self._transition_time_ns / 1_000_000
+            barrier_ms = self._barrier_time_ns / 1_000_000
             logger.info(
                 f"[BATCH1-STATS] step={self.step_id} "
                 f"MPS_transitions={self._num_mps_transitions} "
                 f"encoder_reopens={self._num_encoder_reopens} "
                 f"barriers={self._num_barriers} "
-                f"barrier_reopens={self._num_barrier_reopens}"
+                f"barrier_reopens={self._num_barrier_reopens} "
+                f"dispatches={self._num_dispatches}"
             )
+            if self._profile_enabled:
+                logger.info(
+                    f"[BATCH1-TIMING] step={self.step_id} "
+                    f"transition_time={transition_ms:.2f}ms "
+                    f"barrier_time={barrier_ms:.2f}ms"
+                )
 
         # Release scratch allocations
         self._release_scratch()
@@ -237,8 +254,17 @@ class EngineStepContext:
             raise RuntimeError("end_compute_encoder_for_mps only allowed during ENCODE phase")
 
         if self._encoder is not None:
+            # === TIMING: Measure transition overhead ===
+            if self._profile_enabled:
+                import time
+                t_start = time.perf_counter_ns()
+
             self._encoder.endEncoding()
             self._encoder = None
+
+            if self._profile_enabled:
+                self._transition_time_ns += time.perf_counter_ns() - t_start
+
             # === INSTRUMENTATION: Track MPS transition ===
             self._num_mps_transitions += 1
             self._encoder_was_closed_for_mps = True
@@ -279,6 +305,22 @@ class EngineStepContext:
             value: True to enable batch=1 optimizations
         """
         self._decode_single_seq = value
+
+    def get_profiling_stats(self) -> dict:
+        """Get profiling statistics for this step.
+
+        Returns:
+            Dictionary with counters and timing data
+        """
+        return {
+            "mps_transitions": self._num_mps_transitions,
+            "encoder_reopens": self._num_encoder_reopens,
+            "barriers": self._num_barriers,
+            "barrier_reopens": self._num_barrier_reopens,
+            "dispatches": self._num_dispatches,
+            "transition_time_ms": self._transition_time_ns / 1_000_000,
+            "barrier_time_ms": self._barrier_time_ns / 1_000_000,
+        }
 
     def allocate_scratch(self, size: int, name: str = "scratch") -> Any:
         """Allocate scratch buffer for this step.
@@ -376,6 +418,8 @@ class EngineStepContext:
         groups = MTLSize(threadgroups[0], threadgroups[1], threadgroups[2])
         threads = MTLSize(threads_per_threadgroup[0], threads_per_threadgroup[1], threads_per_threadgroup[2])
         self._encoder.dispatchThreadgroups_threadsPerThreadgroup_(groups, threads)
+        # === INSTRUMENTATION: Track dispatch count ===
+        self._num_dispatches += 1
 
     def memory_barrier(self) -> None:
         """Insert memory barrier for buffer coherence.
@@ -389,6 +433,11 @@ class EngineStepContext:
         if self._current_phase != EnginePhase.ENCODE:
             raise RuntimeError("memory_barrier only allowed during ENCODE phase")
 
+        # === TIMING: Measure barrier overhead ===
+        if self._profile_enabled:
+            import time
+            t_start = time.perf_counter_ns()
+
         # === INSTRUMENTATION: Track barrier calls ===
         self._num_barriers += 1
         encoder_was_none = self._encoder is None
@@ -399,6 +448,9 @@ class EngineStepContext:
             # Re-open encoder if it was closed for MPS
             encoder = self.get_compute_encoder()
             encoder.memoryBarrierWithScope_(MTLBarrierScopeBuffers)
+
+        if self._profile_enabled:
+            self._barrier_time_ns += time.perf_counter_ns() - t_start
 
     def end_encoding(self) -> None:
         """End command encoding.

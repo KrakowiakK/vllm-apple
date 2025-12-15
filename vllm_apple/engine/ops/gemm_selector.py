@@ -83,6 +83,17 @@ class UnifiedGEMM:
         self._mps_gemm = None
         self._metal_gemm = None
 
+        # === SIZE-BASED THRESHOLDS FOR METAL VS MPS ===
+        # Metal kernels are NOT competitive with MPS for large matrices.
+        # MPS encoder transition overhead (~0.1-0.2ms) is smaller than the
+        # performance gap between Metal and MPS for large K or N.
+        #
+        # Conservative thresholds based on Devstral (hidden=5120, intermediate=14336):
+        # - K > 2048: MPS is faster (e.g., down_proj K=14336)
+        # - N > 4096: MPS is faster (e.g., gate/up N=14336, LM head N=131072)
+        self._metal_k_threshold = int(os.environ.get("VLLM_METAL_GEMM_K_THRESH", "2048"))
+        self._metal_n_threshold = int(os.environ.get("VLLM_METAL_GEMM_N_THRESH", "4096"))
+
         # Initialize based on backend
         if self._backend in ("auto", "mps"):
             self._init_mps()
@@ -118,11 +129,10 @@ class UnifiedGEMM:
     ) -> bool:
         """Determine if Metal backend should be used.
 
-        Heuristics for auto mode:
-        - Use Metal for batch=1 decode (avoids MPS encoder transitions)
-        - Use Metal for small M (decode phase)
-        - Use Metal for very large N (LM head)
-        - Use MPS as default (well-optimized by Apple)
+        Heuristics for auto mode with size-based thresholds:
+        - Use Metal for batch=1 decode ONLY when matrix is small enough
+        - Use MPS for large K or N (MPS is faster for large matrices)
+        - MPS encoder transition overhead is smaller than Metal's performance gap
 
         Args:
             step_ctx: EngineStepContext (may have decode_single_seq flag)
@@ -138,20 +148,26 @@ class UnifiedGEMM:
         if self._backend == "mps":
             return False
 
+        # === SIZE-BASED SELECTION ===
+        # CRITICAL: Metal kernels are NOT competitive with MPS for large matrices.
+        # The encoder transition overhead (~0.1-0.2ms) is smaller than the
+        # performance gap between Metal and MPS for large K or N.
+        #
+        # Only use Metal when K and N are both small enough.
+        size_ok_for_metal = (
+            K <= self._metal_k_threshold and
+            N <= self._metal_n_threshold
+        )
+
         # === BATCH=1 DECODE OPTIMIZATION ===
-        # When decode_single_seq is True, always use native Metal to avoid
-        # MPS encoder transitions (end/reopen cycle). This is the primary
-        # optimization for batch=1 decode latency.
+        # When decode_single_seq is True, use Metal ONLY for small matrices.
+        # For large matrices (like Devstral's MLP and LM head), use MPS.
         if hasattr(step_ctx, 'decode_single_seq') and step_ctx.decode_single_seq:
-            return True
+            return size_ok_for_metal
 
-        # Auto mode heuristics
-        # Small-M decode: Metal kernel is optimized for this
-        if M <= 8:
-            return True
-
-        # Very large N (LM head with big vocab): Metal can stream better
-        if N > 65536:
+        # Auto mode heuristics for non-batch=1-decode paths
+        # Small-M with small K/N: Metal kernel is optimized for this
+        if M <= 8 and size_ok_for_metal:
             return True
 
         # Default to MPS for general cases (well-optimized)

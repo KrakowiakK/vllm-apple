@@ -367,7 +367,8 @@ class EngineRunner:
         self,
         step_desc: StepDescriptor,
         inputs: EngineInputs,
-    ) -> EngineOutputs:
+        return_step_ctx: bool = False,
+    ):
         """Execute a single forward pass.
 
         This is the main entry point for inference. It:
@@ -385,9 +386,10 @@ class EngineRunner:
         Args:
             step_desc: Step descriptor with metadata
             inputs: Input tensors (all on CPU)
+            return_step_ctx: If True, return profiling stats from step context
 
         Returns:
-            EngineOutputs with logits on CPU
+            EngineOutputs with logits on CPU, or (EngineOutputs, profiling_stats) if return_step_ctx=True
 
         """
         self._step_counter += 1
@@ -626,14 +628,23 @@ class EngineRunner:
                 topk_values = None
             step_ctx.readback_complete()
 
+            # Capture profiling stats before exiting context (if requested)
+            profiling_stats = None
+            if return_step_ctx:
+                profiling_stats = step_ctx.get_profiling_stats()
+
             # Release scratch buffers used in this step
             self._context.release_scratch_for_step(step_desc.step_id)
 
-        return EngineOutputs(
+        outputs = EngineOutputs(
             logits=logits,
             topk_indices=topk_indices,
             topk_values=topk_values,
         )
+
+        if return_step_ctx:
+            return outputs, profiling_stats
+        return outputs
 
     def _encode_transformer_layer(
         self,
