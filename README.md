@@ -34,15 +34,17 @@ Unlike `llama.cpp` which targets edge inference and broad compatibility, this en
 
 ### 🚀 Performance (M3 Ultra)
 
-**1. Engine Overhead & Latency** (Verified on Qwen2-0.5B to isolate software efficiency from memory bandwidth):
-*   **Prefill Throughput**: >84,000 tokens/sec (Batch 16). *Demonstrates near-zero kernel launch overhead.*
-*   **Decode Throughput**: >300 tokens/sec (Batch 16).
-*   **Scaling**: Linear scaling observed up to Batch 8.
+**1. Devstral-Small (22B) Real-World Benchmarks**:
+*   **Memory Usage**: ~31 GB (RSS). Fits comfortably on 64GB/128GB Macs.
+*   **Prefill**: 70 tok/s (Batch 1) → 104 tok/s (Batch 2).
+*   **Decode**: 10.3 tok/s (Batch 1).
+*   *Analysis*: Current Python dispatch (`runner.py` loop) limits performance to ~100ms/step. Theoretical limit for this hardware is ~30-35 tok/s. C++ Graph Capture (Phase 2 optimization) is required to close this gap.
 
-**2. Projected Performance for Large Models (Memory Bound)**
-For models like **Devstral (24B)** or **Llama-3 (70B)**, performance will be limited by M3 Ultra's memory bandwidth (~800 GB/s):
-*   **24B Model**: Expect ~30-35 tokens/sec (Decoder, Batch 1).
-*   **Note**: The engine's low overhead ensures we hit the theoretical memory bandwidth limit on these models.
+**2. Engine Overhead (Qwen2-0.5B Proxy)**:
+*   To verify the Metal Kernels themselves are fast (ignoring CPU overhead):
+*   **Prefill**: 84,000 tok/s (Batch 16).
+*   **Decode**: 300+ tok/s (Batch 16).
+*   *Conclusion*: The GPU kernels are production-ready; the CPU-side Python scheduler is the current bottleneck for low-batch latency.
 
 ### 🚧 Roadmap / Missing Features
 *   **Quantization**:
