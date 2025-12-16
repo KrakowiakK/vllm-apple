@@ -123,8 +123,8 @@ kernel void silu_mul_kernel(
     output[idx] = half(silu_g * u);
 }
 
-// RoPE (Rotary Position Embedding)
-// Applies rotation to pairs of elements based on position
+// RoPE (Rotary Position Embedding) - Interleaved style (GPT-J)
+// Pairs: (x[0], x[1]), (x[2], x[3]), ...
 // positions buffer contains the actual position ID for each token
 kernel void rope_kernel(
     device half* query [[buffer(0)]],
@@ -152,7 +152,7 @@ kernel void rope_kernel(
     float cos_val = cos_cache[cache_idx];
     float sin_val = sin_cache[cache_idx];
 
-    // Apply to query
+    // Apply to query (interleaved: pairs are adjacent)
     if (head_idx < num_heads) {
         uint q_base = token_idx * num_heads * head_size + head_idx * head_size;
         uint q_idx0 = q_base + pair_idx * 2;
@@ -179,6 +179,65 @@ kernel void rope_kernel(
     }
 }
 
+// RoPE (Rotary Position Embedding) - Neox style (GPT-NeoX / Llama / Mistral)
+// Pairs: (x[0], x[d/2]), (x[1], x[d/2+1]), ... (split-half)
+// This is the DEFAULT style used by Llama, Mistral, and most modern LLMs
+kernel void rope_neox_kernel(
+    device half* query [[buffer(0)]],
+    device half* key [[buffer(1)]],
+    device const float* cos_cache [[buffer(2)]],
+    device const float* sin_cache [[buffer(3)]],
+    device const int* positions [[buffer(4)]],  // Position ID for each token
+    constant uint& head_size [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& rotary_dim [[buffer(8)]],
+    uint3 pos [[thread_position_in_grid]]  // (head_pair_idx, head_idx, token_idx)
+) {
+    uint pair_idx = pos.x;  // Which pair within rotary_dim/2
+    uint head_idx = pos.y;  // Which head
+    uint token_idx = pos.z; // Which token in batch
+
+    uint half_rotary = rotary_dim / 2;
+    if (pair_idx >= half_rotary) return;
+
+    // Get actual position ID for this token (NOT token_idx which is batch order)
+    int position_id = positions[token_idx];
+
+    // Get cos/sin for this position and pair
+    uint cache_idx = position_id * half_rotary + pair_idx;
+    float cos_val = cos_cache[cache_idx];
+    float sin_val = sin_cache[cache_idx];
+
+    // Apply to query (neox: first half pairs with second half)
+    if (head_idx < num_heads) {
+        uint q_base = token_idx * num_heads * head_size + head_idx * head_size;
+        // Neox style: x[pair_idx] pairs with x[pair_idx + half_rotary]
+        uint q_idx0 = q_base + pair_idx;                // First half: 0, 1, 2, ..., d/2-1
+        uint q_idx1 = q_base + pair_idx + half_rotary;  // Second half: d/2, d/2+1, ..., d-1
+
+        float q0 = float(query[q_idx0]);
+        float q1 = float(query[q_idx1]);
+
+        query[q_idx0] = half(q0 * cos_val - q1 * sin_val);
+        query[q_idx1] = half(q0 * sin_val + q1 * cos_val);
+    }
+
+    // Apply to key (KV heads may be fewer)
+    if (head_idx < num_kv_heads) {
+        uint k_base = token_idx * num_kv_heads * head_size + head_idx * head_size;
+        // Neox style: x[pair_idx] pairs with x[pair_idx + half_rotary]
+        uint k_idx0 = k_base + pair_idx;
+        uint k_idx1 = k_base + pair_idx + half_rotary;
+
+        float k0 = float(key[k_idx0]);
+        float k1 = float(key[k_idx1]);
+
+        key[k_idx0] = half(k0 * cos_val - k1 * sin_val);
+        key[k_idx1] = half(k0 * sin_val + k1 * cos_val);
+    }
+}
+
 // Scalar multiply: output = input * scalar
 kernel void scalar_mul_kernel(
     device const half* input [[buffer(0)]],
@@ -187,6 +246,16 @@ kernel void scalar_mul_kernel(
     uint idx [[thread_position_in_grid]]
 ) {
     output[idx] = half(float(input[idx]) * scalar);
+}
+
+// Bias add in-place: data[idx] += bias[idx % feature_dim]
+kernel void bias_add_inplace_kernel(
+    device half* data [[buffer(0)]],
+    device const half* bias [[buffer(1)]],
+    constant uint& feature_dim [[buffer(2)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    data[idx] = data[idx] + bias[idx % feature_dim];
 }
 """
 
@@ -226,7 +295,9 @@ class EngineElementwiseOps:
             "gelu_kernel",
             "silu_mul_kernel",
             "rope_kernel",
+            "rope_neox_kernel",  # Neox style (default for Llama/Mistral)
             "scalar_mul_kernel",
+            "bias_add_inplace_kernel",
         ]
         for name in kernel_names:
             self._pipelines[name] = self._context.get_pipeline("elementwise", name)
@@ -496,11 +567,58 @@ class EngineElementwiseOps:
 
         self._dispatch_simple(encoder, "scalar_mul_kernel", num_elements)
 
+    def encode_bias_add_inplace(
+        self,
+        step_ctx: Any,
+        data: Union[EngineTensor, Any],
+        bias: Union[EngineTensor, Any],
+        feature_dim: int,
+        num_elements: int,
+    ) -> None:
+        """Encode in-place bias addition (broadcasted).
+        
+        data[i] += bias[i % feature_dim]
+        
+        Args:
+            step_ctx: EngineStepContext
+            data: Input/Output tensor (flattened)
+            bias: Bias tensor [feature_dim]
+            feature_dim: Dimension of bias vector
+            num_elements: Total elements in data
+        """
+        if not step_ctx.is_encoding:
+            raise RuntimeError("encode() called outside ENCODE phase")
+
+        encoder = step_ctx.get_compute_encoder()
+        
+        d_buf = data.buffer if isinstance(data, EngineTensor) else data
+        b_buf = bias.buffer if isinstance(bias, EngineTensor) else bias
+        
+        d_off = data.offset if isinstance(data, EngineTensor) else 0
+        b_off = bias.offset if isinstance(bias, EngineTensor) else 0
+        
+        import struct
+        dim_bytes = struct.pack("I", feature_dim)
+        
+        encoder.setBuffer_offset_atIndex_(d_buf, d_off, 0)
+        encoder.setBuffer_offset_atIndex_(b_buf, b_off, 1)
+        encoder.setBytes_length_atIndex_(dim_bytes, 4, 2)
+        
+        self._dispatch_simple(encoder, "bias_add_inplace_kernel", num_elements)
+
 
 class EngineRoPE:
     """Rotary Position Embedding operation.
 
     Applies rotation to Q and K based on position.
+
+    Supports two RoPE styles:
+    - is_neox_style=True (default): GPT-NeoX/Llama/Mistral style
+      Pairs: (x[0], x[d/2]), (x[1], x[d/2+1]), ... (split-half)
+    - is_neox_style=False: GPT-J style
+      Pairs: (x[0], x[1]), (x[2], x[3]), ... (interleaved)
+
+    Most modern LLMs (Llama, Mistral, etc.) use is_neox_style=True.
     """
 
     def __init__(
@@ -512,6 +630,7 @@ class EngineRoPE:
         rotary_dim: Optional[int] = None,
         max_position: int = 8192,
         base: float = 10000.0,
+        is_neox_style: bool = True,  # Default True for Llama/Mistral compatibility
     ):
         """Initialize RoPE.
 
@@ -523,6 +642,9 @@ class EngineRoPE:
             rotary_dim: Dimension to apply rotation (default: head_size)
             max_position: Maximum sequence length
             base: RoPE base frequency
+            is_neox_style: If True, use GPT-NeoX/Llama style (split-half).
+                          If False, use GPT-J style (interleaved).
+                          Default is True for compatibility with most LLMs.
         """
         self._context = context
         self.head_size = head_size
@@ -531,6 +653,7 @@ class EngineRoPE:
         self.rotary_dim = rotary_dim or head_size
         self.max_position = max_position
         self.base = base
+        self.is_neox_style = is_neox_style
 
         # Precompute cos/sin cache
         self._cos_cache = None
@@ -539,11 +662,19 @@ class EngineRoPE:
 
         # Compile kernel (use shared elementwise library)
         context.compile_library("elementwise", source_code=ELEMENTWISE_KERNEL_SOURCE)
-        self._pipeline = context.get_pipeline("elementwise", "rope_kernel")
 
+        # Select kernel based on RoPE style
+        if self.is_neox_style:
+            kernel_name = "rope_neox_kernel"
+        else:
+            kernel_name = "rope_kernel"
+        self._pipeline = context.get_pipeline("elementwise", kernel_name)
+
+        style_name = "neox (split-half)" if is_neox_style else "interleaved (GPT-J)"
         logger.info(
             f"EngineRoPE initialized: head_size={head_size}, "
-            f"rotary_dim={self.rotary_dim}, max_pos={max_position}"
+            f"rotary_dim={self.rotary_dim}, max_pos={max_position}, "
+            f"style={style_name}"
         )
 
     def _precompute_cache(self) -> None:

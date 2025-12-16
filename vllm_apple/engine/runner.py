@@ -28,10 +28,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import struct
 import ctypes
 
+import os
 import torch
 import numpy as np
 
 from vllm.logger import init_logger
+
+# Debug checkpoint capture (gated by VLLM_PREFILL_EQ_DEBUG=1)
+CHECKPOINT_DEBUG_ENABLED = os.environ.get("VLLM_PREFILL_EQ_DEBUG", "0") == "1"
 from .context import MetalEngineContext
 from .step import EngineStepContext
 from .tensor import EngineTensor, EngineDType
@@ -135,6 +139,10 @@ class EngineRunner:
             f"EngineRunner initialized: {model_desc.num_layers} layers, "
             f"hidden_size={model_desc.hidden_size}, vocab_size={model_desc.vocab_size}"
         )
+        
+        # Initialize debug checkpoint queue
+        self._pending_checkpoints = []
+
 
     def _create_operations(self) -> None:
         """Create all operation instances."""
@@ -149,6 +157,11 @@ class EngineRunner:
 
         # Create layer operations
         self._layers: List[TransformerLayerOps] = []
+        
+        import logging
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("DEBUG: EngineRunner __init__ called")
+        self.logger.info(f"DEBUG: Initializing EngineRoPE with theta={md.rope_theta}")
         for layer_idx in range(md.num_layers):
             layer_ops = TransformerLayerOps(
                 input_norm=EngineRMSNorm(
@@ -239,6 +252,14 @@ class EngineRunner:
 
         # Embedding
         self._embedding.set_weights(w.embedding)
+        
+        # DEBUG: Verify first few weights
+        if w.embedding is not None:
+            import numpy as np
+            size = 20 * 2 # 20 elements * 2 bytes
+            view = w.embedding.contents().as_buffer(size)
+            chk_np = np.frombuffer(view, dtype=np.float16)
+            logger.info(f"DEBUG: GPU embedding weights[:20]: {chk_np.tolist()}")
 
         # Layers
         for layer_idx, layer_ops in enumerate(self._layers):
@@ -250,13 +271,18 @@ class EngineRunner:
             # Models may use either pattern depending on architecture/source
             if lw.qkv_proj is not None:
                 # Fused QKV weights (single matrix)
-                layer_ops.qkv_proj.set_weights(qkv_weight=lw.qkv_proj)
+                layer_ops.qkv_proj.set_weights(
+                    qkv_weight=lw.qkv_proj,
+                    bias_buffer=lw.qkv_bias,
+                )
             elif lw.q_proj is not None and lw.k_proj is not None and lw.v_proj is not None:
                 # Separate Q, K, V weights
+                logger.info(f"DEBUG: Setting separate weights for layer {layer_idx}: q={lw.q_proj}, k={lw.k_proj}, v={lw.v_proj}")
                 layer_ops.qkv_proj.set_weights(
                     q_weight=lw.q_proj,
                     k_weight=lw.k_proj,
                     v_weight=lw.v_proj,
+                    bias_buffer=lw.qkv_bias,
                 )
             else:
                 # Neither found - this is a weight loading failure
@@ -267,7 +293,7 @@ class EngineRunner:
                     f"q_proj={lw.q_proj is not None}, k_proj={lw.k_proj is not None}, v_proj={lw.v_proj is not None}"
                 )
 
-            layer_ops.o_proj.set_weights(lw.o_proj)
+            layer_ops.o_proj.set_weights(lw.o_proj, bias_buffer=lw.o_proj_bias)
             layer_ops.post_attn_norm.set_weights(lw.post_attention_layernorm)
 
             # Handle both fused gate-up and separate gate/up weights
@@ -369,30 +395,166 @@ class EngineRunner:
         inputs: EngineInputs,
         return_step_ctx: bool = False,
     ):
-        """Execute a single forward pass.
-
-        This is the main entry point for inference. It:
-        1. Creates a step context with command buffer
-        2. Encodes embedding lookup
-        3. Encodes all transformer layers
-        4. Encodes LM head projection
-        5. Submits and waits
-        6. Returns logits on CPU
-
-        Supports both:
-        - Decode steps (typically 1 token per sequence) using fused KV-write+attention
-        - Prefill/mixed steps (num_tokens may exceed num_seqs) using token-parallel attention
-
-        Args:
-            step_desc: Step descriptor with metadata
-            inputs: Input tensors (all on CPU)
-            return_step_ctx: If True, return profiling stats from step context
-
-        Returns:
-            EngineOutputs with logits on CPU, or (EngineOutputs, profiling_stats) if return_step_ctx=True
-
-        """
+        """Execute a single forward pass (with auto-chunking)."""
+        self.logger.info(f"DEBUG: execute_step called for step {step_desc.step_id}")
+        # Increment step counter once per logical step
         self._step_counter += 1
+        num_tokens = step_desc.num_scheduled_tokens
+
+        # Identify indices of the last token of each sequence
+        # These are the ONLY logits we need to return.
+        if inputs.query_start_locs is None:
+             raise ValueError("inputs.query_start_locs is required")
+        
+        # Debug Tokens
+        logger.info(f"Step inputs: num_tokens={num_tokens}. IDs[:10]={inputs.token_ids[:10]}. IDs[-10:]={inputs.token_ids[-10:]}")
+        logger.info(f"Query Start Locs: {inputs.query_start_locs}")
+        
+        # Ensure CPU / Long for indexing
+        qsl = inputs.query_start_locs.to(device="cpu", dtype=torch.long)
+        # qsl is [0, len1, len1+len2, ...]. 
+        # Last tokens are at qsl[1:] - 1
+        last_token_indices = qsl[1:] - 1
+        
+        # Check capacity
+        if num_tokens <= self._max_scratch_tokens:
+            out = self._execute_slice(step_desc, inputs, return_step_ctx=return_step_ctx)
+            
+            # Post-process: Filter logits to only last tokens
+            # Handle tuple return (outputs, profile_data)
+            actual_out = out[0] if isinstance(out, tuple) else out
+            
+            if actual_out.logits is not None:
+                # logits shape: [num_tokens, vocab]
+                # filter shape: [batch_size, vocab]
+                actual_out.logits = actual_out.logits[last_token_indices]
+                
+                # Debug Dump for Verification
+                import os
+                if os.environ.get("VLLM_DUMP_LOGITS"):
+                    try:
+                        dump_path = f"/tmp/vllm_logits_{self._step_counter}_{os.getpid()}.pt"
+                        torch.save(actual_out.logits, dump_path)
+                        logger.info(f"Dumped logits to {dump_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to dump logits: {e}")
+
+            return out
+
+        # === CHUNKED EXECUTION ===
+        logger.info(
+            f"Step {self._step_counter}: splitting {num_tokens} tokens into chunks "
+            f"(limit {self._max_scratch_tokens})."
+        )
+        
+        # 1. Compute global token_to_seq (needed for prefill slices)
+        global_token_to_seq = None
+        if step_desc.is_prefill:
+            global_token_to_seq = self._derive_token_to_seq(inputs, step_desc.num_seqs_active, num_tokens)
+
+        # 2. Loop chunks
+        chunk_size = self._max_scratch_tokens
+        collected_logits = []
+        import copy
+        
+        for start_idx in range(0, num_tokens, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_tokens)
+            current_chunk_len = end_idx - start_idx
+            
+            # Slice inputs
+            chunk_inputs = copy.copy(inputs)
+            chunk_inputs.token_ids = inputs.token_ids[start_idx:end_idx]
+            chunk_inputs.positions = inputs.positions[start_idx:end_idx]
+            chunk_inputs.slot_mapping = inputs.slot_mapping[start_idx:end_idx]
+            
+            # Slice token_to_seq if present
+            chunk_token_to_seq = None
+            if global_token_to_seq is not None:
+                chunk_token_to_seq = global_token_to_seq[start_idx:end_idx]
+                
+            # Create chunk step descriptor
+            chunk_step_desc = copy.copy(step_desc)
+            chunk_step_desc.num_scheduled_tokens = current_chunk_len
+            
+            # Execute slice
+            chunk_out = self._execute_slice(
+                chunk_step_desc, 
+                chunk_inputs, 
+                return_step_ctx=False,
+                token_to_seq_override=chunk_token_to_seq
+            )
+            
+            # Extract relevant logits
+            # Find which 'last tokens' fall in this chunk
+            mask = (last_token_indices >= start_idx) & (last_token_indices < end_idx)
+            if mask.any():
+                # Global indices of last tokens in this chunk
+                relevant_globals = last_token_indices[mask]
+                # Map to local chunk indices
+                relevant_locals = relevant_globals - start_idx
+                # Extract rows
+                rows = chunk_out.logits[relevant_locals]
+                collected_logits.append(rows)
+            
+            # Discard rest of logits to save memory
+            chunk_out.logits = None # hinting GC
+            
+        # 3. Aggregate
+        if not collected_logits:
+             # Should not happen unless batch size 0?
+             full_logits = torch.empty((0, self._vocab_size), dtype=torch.float16)
+        else:
+             full_logits = torch.cat(collected_logits, dim=0)
+
+        # Debug Dump for Verification
+        import os
+        if os.environ.get("VLLM_DUMP_LOGITS"):
+            try:
+                # full_logits is now already filtered to [batch_size, vocab]
+                dump_path = f"/tmp/vllm_logits_{self._step_counter}_{os.getpid()}.pt"
+                torch.save(full_logits, dump_path)
+                logger.info(f"Dumped logits to {dump_path}")
+            except Exception as e:
+                logger.error(f"Failed to dump logits: {e}")
+        
+        return EngineOutputs(
+            logits=full_logits,
+            topk_indices=None, 
+            topk_values=None
+        )
+
+    def _derive_token_to_seq(self, inputs: EngineInputs, num_seqs: int, num_tokens: int) -> torch.Tensor:
+        """Helper to derive token_to_seq map for prefill."""
+        if inputs.query_start_locs is None:
+             raise ValueError("Prefill step requires query_start_locs")
+             
+        qsl = inputs.query_start_locs.to(torch.int32)
+        if qsl.numel() != num_seqs + 1:
+            raise ValueError(f"query_start_locs has {qsl.numel()}, expected {num_seqs + 1}")
+
+        lens = (qsl[1:] - qsl[:-1]).to(torch.int64)
+        if (lens < 0).any():
+             raise ValueError("Negative query length found")
+             
+        token_to_seq = torch.repeat_interleave(
+             torch.arange(num_seqs, dtype=torch.int32),
+             lens,
+        )
+        if token_to_seq.numel() != num_tokens:
+             raise ValueError(f"token_to_seq size {token_to_seq.numel()} mismatch num_tokens {num_tokens}")
+             
+        return token_to_seq
+
+    def _execute_slice(
+        self,
+        step_desc: StepDescriptor,
+        inputs: EngineInputs,
+        return_step_ctx: bool = False,
+        token_to_seq_override: Optional[torch.Tensor] = None,
+    ):
+        """Execute a single forward pass (slice)."""
+        import numpy as np
+        # Note: step_counter incremented in wrapper
         num_tokens = step_desc.num_scheduled_tokens
         num_seqs = step_desc.num_seqs_active
 
@@ -403,16 +565,7 @@ class EngineRunner:
                 f"This may indicate mixed prefill/decode which is not fully supported."
             )
 
-        # Bounds check: prevent buffer overflow in scratch buffers
-        if num_tokens > self._max_scratch_tokens:
-            raise ValueError(
-                f"num_tokens={num_tokens} exceeds scratch buffer capacity "
-                f"({self._max_scratch_tokens}). This would cause buffer overflow. "
-                f"Either reduce batch size or increase max_batch_size in engine config."
-            )
-
         if num_tokens == 0:
-            # Empty step - return empty logits
             return EngineOutputs(
                 logits=torch.empty(0, self.model_desc.vocab_size, dtype=torch.float16),
                 topk_indices=None,
@@ -420,8 +573,6 @@ class EngineRunner:
             )
 
         # Copy inputs to GPU buffers
-        # Ensure proper dtypes: positions, slot_mapping, seq_lens must be int32 for Metal kernels
-        # token_ids must be int32 for embedding kernel (device const int*)
         token_ids_int32 = inputs.token_ids.to(torch.int32) if inputs.token_ids.dtype != torch.int32 else inputs.token_ids
         token_ids_buffer = self._copy_to_buffer(token_ids_int32, "token_ids")
         positions_int32 = inputs.positions.to(torch.int32) if inputs.positions.dtype != torch.int32 else inputs.positions
@@ -432,6 +583,15 @@ class EngineRunner:
         slot_mapping_buffer = self._copy_to_buffer(slot_mapping_int32, "slot_mapping")
         seq_lens_int32 = inputs.seq_lens.to(torch.int32) if inputs.seq_lens.dtype != torch.int32 else inputs.seq_lens
         seq_lens_buffer = self._copy_to_buffer(seq_lens_int32, "seq_lens")
+
+        # DEBUG: Verify token_ids buffer content
+        if self._step_counter <= 2:
+            import numpy as np
+            size = token_ids_int32.numel() * 4
+            view = token_ids_buffer.contents().as_buffer(size)
+            chk_np = np.frombuffer(view, dtype=np.int32)
+            logger.info(f"DEBUG: GPU token_ids buffer content: {chk_np.tolist()}")
+
 
         # Debug: print inputs
         import os
@@ -447,15 +607,12 @@ class EngineRunner:
         max_position_in_batch = int(inputs.positions.max().item()) if num_tokens > 0 else 0
 
         # Compute max_seq_len for attention (on CPU before entering encode phase)
-        # This is more reliable than step_desc.max_num_blocks_per_seq which may be 0
         max_seq_len = int(inputs.seq_lens.max().item()) if inputs.seq_lens.numel() > 0 else 0
 
         # Compute max_blocks_per_seq from actual block_table shape
-        # block_table is [num_seqs, max_blocks_per_seq] - use actual shape to avoid OOB
         if inputs.block_table.ndim == 2 and inputs.block_table.shape[1] > 0:
             max_blocks_per_seq = inputs.block_table.shape[1]
         else:
-            # Fallback: compute from max_seq_len and block_size
             max_blocks_per_seq = (max_seq_len + self._kv_cache.block_size - 1) // self._kv_cache.block_size if max_seq_len > 0 else 1
 
         if (
@@ -470,59 +627,63 @@ class EngineRunner:
                 f"(step {self._step_counter})."
             )
 
-        # Validate inputs before encoding to prevent OOB writes
-        # Always validate block_table to catch seq_lens/block_table inconsistencies
+        # Validate inputs
         if inputs.block_table.numel() > 0:
             self._kv_cache.validate_block_table(
                 inputs.block_table,
                 context=f"step {self._step_counter}"
             )
-
-        # For prefill, validate slot_mapping is within KV cache capacity
         if step_desc.is_prefill and inputs.slot_mapping.numel() > 0:
             self._kv_cache.validate_slot_mapping(
                 inputs.slot_mapping,
                 context=f"step {self._step_counter} prefill"
             )
 
-        # Prefill/mixed steps need a token→sequence mapping to interpret the flattened
-        # query batch. Build it once on CPU and upload as an int32 MTLBuffer.
+        # Prefill/mixed steps need a token→sequence mapping
         token_to_seq_buffer = None
         if step_desc.is_prefill:
-            if inputs.query_start_locs is None:
-                raise ValueError(
-                    "Prefill step requires EngineInputs.query_start_locs "
-                    "(cumulative start offsets, length num_seqs_active + 1)."
-                )
+            if token_to_seq_override is not None:
+                # Use provided override (for chunked prefill)
+                token_to_seq_buffer = self._copy_to_buffer(token_to_seq_override.to(torch.int32), "token_to_seq")
+            else:
+                # Standard derivation
+                if inputs.query_start_locs is None:
+                    raise ValueError(
+                        "Prefill step requires EngineInputs.query_start_locs "
+                        "(cumulative start offsets, length num_seqs_active + 1)."
+                    )
 
-            qsl = inputs.query_start_locs.to(torch.int32)
-            if qsl.numel() != num_seqs + 1:
-                raise ValueError(
-                    f"query_start_locs has {qsl.numel()} elements, expected {num_seqs + 1} "
-                    f"(num_seqs_active={num_seqs})."
+                qsl = inputs.query_start_locs.to(torch.int32)
+                if qsl.numel() != num_seqs + 1:
+                    raise ValueError(
+                        f"query_start_locs has {qsl.numel()} elements, expected {num_seqs + 1} "
+                        f"(num_seqs_active={num_seqs})."
+                    )
+                if int(qsl[0].item()) != 0:
+                    raise ValueError(f"query_start_locs[0] must be 0, got {int(qsl[0].item())}")
+                if int(qsl[-1].item()) != num_tokens:
+                    raise ValueError(
+                        f"query_start_locs[-1] must equal num_tokens ({num_tokens}), "
+                        f"got {int(qsl[-1].item())}."
+                    )
+                
+                # Check for negative lengths/monotonicity
+                lens = (qsl[1:] - qsl[:-1]).to(torch.int64)
+                if (lens < 0).any():
+                     raise ValueError("query_start_locs must be non-decreasing")
+                
+                token_to_seq = torch.repeat_interleave(
+                    torch.arange(num_seqs, dtype=torch.int32),
+                    lens,
                 )
-            if int(qsl[0].item()) != 0:
-                raise ValueError(f"query_start_locs[0] must be 0, got {int(qsl[0].item())}")
-            if int(qsl[-1].item()) != num_tokens:
-                raise ValueError(
-                    f"query_start_locs[-1] must equal num_tokens ({num_tokens}), "
-                    f"got {int(qsl[-1].item())}."
-                )
+                if token_to_seq.numel() != num_tokens:
+                    raise ValueError(
+                        f"token_to_seq has {token_to_seq.numel()} elements, expected num_tokens={num_tokens}."
+                    )
+                token_to_seq_buffer = self._copy_to_buffer(token_to_seq, "token_to_seq")
 
-            lens = (qsl[1:] - qsl[:-1]).to(torch.int64)
-            if (lens < 0).any():
-                raise ValueError("query_start_locs must be non-decreasing (negative query length found).")
-
-            token_to_seq = torch.repeat_interleave(
-                torch.arange(num_seqs, dtype=torch.int32),
-                lens,
-            )
-            if token_to_seq.numel() != num_tokens:
-                raise ValueError(
-                    f"token_to_seq has {token_to_seq.numel()} elements, expected num_tokens={num_tokens}. "
-                    f"This indicates inconsistent query_start_locs."
-                )
-            token_to_seq_buffer = self._copy_to_buffer(token_to_seq, "token_to_seq")
+        # Initialize checkpoint context for debugging
+        self._init_checkpoint_context(num_tokens)
 
         # Create step context
         with EngineStepContext(
@@ -534,13 +695,9 @@ class EngineRunner:
         ) as step_ctx:
             # === ENCODE PHASE ===
 
-            # Set batch=1 decode optimization flag
-            # This enables pure Metal paths (no MPS) to avoid encoder transitions
             if step_desc.step_kind == "decode" and step_desc.num_seqs_active == 1:
                 step_ctx.set_decode_single_seq(True)
 
-            # Reset scratch generation counter for this step
-            # This allows cross-layer scratch buffer reuse
             self._context.reset_scratch_generation()
 
             # Embedding lookup
@@ -551,19 +708,25 @@ class EngineRunner:
                 num_tokens=num_tokens,
             )
 
-            # Track which buffer has current hidden states
+            # DEBUG: Capture embedding output
+            if CHECKPOINT_DEBUG_ENABLED:
+                self._capture_checkpoint(
+                    name="embed_output",
+                    buffer=self._hidden_buffer_a,
+                    shape=(num_tokens, self.model_desc.hidden_size),
+                    dtype=np.float16,
+                    last_token_only=False, # Capture all tokens for embedding verification
+                    step_ctx=step_ctx,
+                )
+
             current_hidden = self._hidden_buffer_a
             other_hidden = self._hidden_buffer_b
 
-            # Memory barrier after embedding
             step_ctx.memory_barrier()
 
             # Process each transformer layer
-            # Each layer's scratch allocations are scoped so buffers can be
-            # reused across layers (generation-based reuse)
             for layer_idx, layer_ops in enumerate(self._layers):
                 with step_ctx.layer_scope(layer_idx):
-                    # Process transformer layer
                     current_hidden, other_hidden = self._encode_transformer_layer(
                         step_ctx=step_ctx,
                         layer_idx=layer_idx,
@@ -591,7 +754,6 @@ class EngineRunner:
                 num_tokens=num_tokens,
             )
             current_hidden, other_hidden = other_hidden, current_hidden
-
             step_ctx.memory_barrier()
 
             # LM head
@@ -602,7 +764,7 @@ class EngineRunner:
                 num_tokens=num_tokens,
             )
 
-            # Top-K selection (optional, reduces GPU-to-CPU transfer by ~800x)
+            # Top-K selection
             if self._topk_op is not None:
                 step_ctx.memory_barrier()
                 self._topk_op.encode(
@@ -619,7 +781,29 @@ class EngineRunner:
             step_ctx.submit()
             step_ctx.wait_until_completed()
 
+            # PROCESS PENDING CHECKPOINTS (Deferred Readback)
+            if hasattr(self, "_pending_checkpoints") and self._pending_checkpoints:
+                for req in self._pending_checkpoints:
+                    self._process_checkpoint_read(
+                        req["name"], req["buffer"], req["shape"], 
+                        req["dtype"], req["offset"], 
+                        req["last_token_only"], req["num_tokens"]
+                    )
+                self._pending_checkpoints.clear()
+
+            # === CHECKPOINT CAPTURE (DEBUG) ===
+            if CHECKPOINT_DEBUG_ENABLED:
+                self._capture_checkpoint(
+                    name="lm_head_logits",
+                    buffer=self._logits_buffer,
+                    shape=(num_tokens, self.model_desc.vocab_size),
+                    dtype=np.float16,
+                    num_tokens=num_tokens,
+                )
+
             # === READBACK PHASE ===
+            # For chunked execution (override set), we skip TopK opt to ensure simple logic
+            # OR we can keep it if enabled. Logic below handles it.
             if self._topk_op is not None:
                 logits, topk_indices, topk_values = self._readback_topk_logits(num_tokens)
             else:
@@ -628,18 +812,14 @@ class EngineRunner:
                 topk_values = None
             step_ctx.readback_complete()
 
-            # Capture profiling stats before exiting context (if requested)
             profiling_stats = None
             if return_step_ctx:
                 profiling_stats = step_ctx.get_profiling_stats()
 
-            # Release scratch buffers used in this step
             self._context.release_scratch_for_step(step_desc.step_id)
 
         outputs = EngineOutputs(
             logits=logits,
-            topk_indices=topk_indices,
-            topk_values=topk_values,
         )
 
         if return_step_ctx:
@@ -666,15 +846,6 @@ class EngineRunner:
         max_blocks_per_seq: int,
     ) -> Tuple[Any, Any]:
         """Encode a single transformer layer.
-
-        Args:
-            step_ctx: Step context
-            layer_idx: Layer index
-            layer_ops: Layer operations
-            hidden_states: Input hidden states buffer
-            residual_buffer: Buffer for residual connection
-            positions_buffer: Position IDs buffer (int32)
-            block_table_buffer: Block table buffer (int32)
             slot_mapping_buffer: Slot mapping buffer (int32)
             seq_lens_buffer: Sequence lengths buffer (int32)
             num_tokens: Number of tokens
@@ -717,8 +888,18 @@ class EngineRunner:
         )
 
         # Barrier after input_norm: Skip for batch=1 decode (coalesce with QKV)
+
         if not use_reduced_barriers:
             step_ctx.memory_barrier()
+
+        if CHECKPOINT_DEBUG_ENABLED:
+            self._capture_checkpoint(
+                 name=f"layer{layer_idx}_input_norm",
+                 buffer=hidden_states,
+                 shape=(num_tokens, md.hidden_size),
+                 dtype=np.float16,
+                 step_ctx=step_ctx,
+            )
 
         # 2. QKV Projection
         layer_ops.qkv_proj.encode(
@@ -727,6 +908,9 @@ class EngineRunner:
             qkv_output=qkv_buffer,
             num_tokens=num_tokens,
         )
+
+        # Capture moved
+
 
         # Barrier after QKV: Skip for batch=1 decode (coalesce with RoPE)
         if not use_reduced_barriers:
@@ -749,81 +933,159 @@ class EngineRunner:
             offset=k_offset_bytes,
         )
 
-        layer_ops.rope.encode(
-            step_ctx=step_ctx,
-            query=qkv_buffer,
-            key=k_tensor,
-            positions=positions_buffer,
-            num_tokens=num_tokens,
-            max_position_in_batch=max_position_in_batch,
-        )
+
+        # Phase B: Isolation Toggles - Hybrid Execution
+        if os.environ.get("VLLM_PREFILL_FORCE_PYTORCH_ROPE") == "1":
+            step_ctx.flush_and_sync()
+            self._cpu_rope(step_ctx, qkv_buffer, positions_buffer, num_tokens, layer_idx)
+        else:
+            layer_ops.rope.encode(
+                step_ctx=step_ctx,
+                query=qkv_buffer,
+                key=k_tensor,
+                positions=positions_buffer,
+                num_tokens=num_tokens,
+                max_position_in_batch=max_position_in_batch,
+            )
 
         # BARRIER 1: QKV + RoPE complete (always needed before attention)
         step_ctx.memory_barrier()
 
-        # 4. Attention (decode-only): fused KV-write + attention
-        # Get KV cache buffers for this layer
-        k_cache, v_cache = self._kv_cache.get_buffers(layer_idx)
+        if CHECKPOINT_DEBUG_ENABLED and os.environ.get("VLLM_DUMP_ROPE") == "1":
+             logger.info(f"DEBUG: RoPE Capture - layer {layer_idx}, num_tokens={num_tokens}, head_size={md.head_size}")
+             # Capture Post-RoPE outputs
+             # self._capture_checkpoint(
+             #     name=f"layer{layer_idx}_rope_q",
+             #     buffer=qkv_buffer,
+             #     shape=(num_tokens, md.num_attention_heads, md.head_size),
+             #     dtype=np.float16,
+             #     offset=0,
+             #     last_token_only=True, 
+             #     step_ctx=step_ctx,
+             # )
+             
+             # self._capture_checkpoint(
+             #     name=f"layer{layer_idx}_rope_k",
+             #     buffer=qkv_buffer,
+             #     shape=(num_tokens, md.num_kv_heads, md.head_size),
+             #     dtype=np.float16,
+             #     offset=k_offset_bytes,
+             #     last_token_only=True,
+             #     step_ctx=step_ctx,
+             # )
+             # K is harder because it is interleaved or offset? 
+             # qkv_buffer is flattened [tokens, heads+2kv, head_size]
+             # OR is it separate Q and K buffers if not packed?
+             # In `execute_slice`, we passed `qkv_buffer` for Q and `k_tensor` for K?
+             # `qkv_buffer` holds ALL (Q, K, V).
+             # We should probably capture the WHOLE `qkv_out` again, now that it is rotated.
+             # `qkv_buffer` holds ALL (Q, K, V).
+             # We should probably capture the WHOLE `qkv_out` again, now that it is rotated.
+             # self._capture_checkpoint(step_ctx, layer_idx, "rope_out_fused", qkv_buffer, offset=0)
 
-        if step_desc.is_prefill:
-            if token_to_seq_buffer is None:
-                raise RuntimeError("token_to_seq_buffer is required for prefill attention")
 
-            # Prefill/mixed: write K/V for every token, then run token-parallel attention.
-            layer_ops.kv_write.encode_prefill(
-                step_ctx=step_ctx,
-                new_keys_buffer=qkv_buffer,
-                new_values_buffer=qkv_buffer,
-                key_buffer=k_cache,
-                value_buffer=v_cache,
-                slot_mapping_buffer=slot_mapping_buffer,
-                num_tokens=num_tokens,
-                new_keys_offset=k_offset_bytes,
-                new_values_offset=v_offset_bytes,
+        # Phase B: Isolation Toggles - Force PyTorch SDPA
+        if os.environ.get("VLLM_PREFILL_FORCE_PYTORCH_SDPA") == "1":
+            step_ctx.flush_and_sync()
+            self._cpu_sdpa(
+                step_ctx, qkv_buffer, attn_output_buffer, 
+                num_tokens, layer_idx, num_seqs, max_seq_len,
+                token_to_seq_buffer
             )
 
-            # Barrier between KV write and prefill attention (always needed)
-            step_ctx.memory_barrier()
-
-            layer_ops.attention.encode_prefill(
-                step_ctx=step_ctx,
-                query_buffer=qkv_buffer,
-                key_buffer=k_cache,
-                value_buffer=v_cache,
-                block_table_buffer=block_table_buffer,
-                token_to_seq_buffer=token_to_seq_buffer,
-                positions_buffer=positions_buffer,
-                output_buffer=attn_output_buffer,
-                num_tokens=num_tokens,
-                num_seqs=num_seqs,
-                max_seq_len=max_seq_len,
-                max_blocks_per_seq=max_blocks_per_seq,
-                query_offset=0,
-                output_offset=0,
-            )
         else:
-            # Decode: fused KV-write + attention.
-            layer_ops.attention.encode_decode_fused(
-                step_ctx=step_ctx,
-                query_buffer=qkv_buffer,  # Q is at start
-                new_keys_buffer=qkv_buffer,
-                new_values_buffer=qkv_buffer,
-                key_buffer=k_cache,
-                value_buffer=v_cache,
-                block_table_buffer=block_table_buffer,
-                seq_lens_buffer=seq_lens_buffer,
-                output_buffer=attn_output_buffer,
-                num_seqs=num_seqs,
-                max_seq_len=max_seq_len,
-                max_blocks_per_seq=max_blocks_per_seq,
-                query_offset=0,
-                new_keys_offset=k_offset_bytes,
-                new_values_offset=v_offset_bytes,
-                output_offset=0,
-            )
+            # 4. Attention (decode-only): fused KV-write + attention
+            # Get KV cache buffers for this layer
+            k_cache, v_cache = self._kv_cache.get_buffers(layer_idx)
+
+            if step_desc.is_prefill:
+                if token_to_seq_buffer is None:
+                    raise RuntimeError("token_to_seq_buffer is required for prefill attention")
+
+                # Prefill/mixed: write K/V for every token, then run token-parallel attention.
+                layer_ops.kv_write.encode_prefill(
+                    step_ctx=step_ctx,
+                    new_keys_buffer=qkv_buffer,
+                    new_values_buffer=qkv_buffer,
+                    key_buffer=k_cache,
+                    value_buffer=v_cache,
+                    slot_mapping_buffer=slot_mapping_buffer,
+                    num_tokens=num_tokens,
+                    new_keys_offset=k_offset_bytes,
+                    new_values_offset=v_offset_bytes,
+                )
+
+                # Barrier between KV write and prefill attention (always needed)
+                step_ctx.memory_barrier()
+
+                if CHECKPOINT_DEBUG_ENABLED:
+                     # Capture Setup Tables
+                     self._capture_checkpoint(f"layer{layer_idx}_slot_mapping", slot_mapping_buffer, (num_tokens,), np.int32, step_ctx=step_ctx)
+                     self._capture_checkpoint(f"layer{layer_idx}_block_table", block_table_buffer, (num_seqs, max_blocks_per_seq), np.int32, step_ctx=step_ctx)
+                     self._capture_checkpoint(f"layer{layer_idx}_token_to_seq", token_to_seq_buffer, (num_tokens,), np.int32, step_ctx=step_ctx)
+                     self._capture_checkpoint(f"layer{layer_idx}_positions", positions_buffer, (num_tokens,), np.int32, step_ctx=step_ctx)
+                     
+                     # Capture First 2 Blocks of KV Cache (to verify write)
+                     # Size: 2 * block_size * num_kv_heads * head_size
+                     cache_block_size = self._kv_cache.block_size * md.num_kv_heads * md.head_size
+                     self._capture_checkpoint(f"layer{layer_idx}_k_cache_block0", k_cache, (2*cache_block_size,), np.float16, step_ctx=step_ctx)
+                     self._capture_checkpoint(f"layer{layer_idx}_v_cache_block0", v_cache, (2*cache_block_size,), np.float16, step_ctx=step_ctx)
+
+                     # Capture Q and K inputs from qkv_buffer
+                     q_size = num_tokens * md.num_attention_heads * md.head_size
+                     k_size = num_tokens * md.num_kv_heads * md.head_size
+                     self._capture_checkpoint(f"layer{layer_idx}_q_input_attn", qkv_buffer, (q_size,), np.float16, offset=0, step_ctx=step_ctx)
+                     self._capture_checkpoint(f"layer{layer_idx}_k_input_write", qkv_buffer, (k_size,), np.float16, offset=k_offset_bytes, step_ctx=step_ctx)
+
+                layer_ops.attention.encode_prefill(
+                    step_ctx=step_ctx,
+                    query_buffer=qkv_buffer,
+                    key_buffer=k_cache,
+                    value_buffer=v_cache,
+                    block_table_buffer=block_table_buffer,
+                    token_to_seq_buffer=token_to_seq_buffer,
+                    positions_buffer=positions_buffer,
+                    output_buffer=attn_output_buffer,
+                    num_tokens=num_tokens,
+                    num_seqs=num_seqs,
+                    max_seq_len=max_seq_len,
+                    max_blocks_per_seq=max_blocks_per_seq,
+                    query_offset=0,
+                    output_offset=0,
+                )
+            else:
+                # Decode: fused KV-write + attention.
+                layer_ops.attention.encode_decode_fused(
+                    step_ctx=step_ctx,
+                    query_buffer=qkv_buffer,  # Q is at start
+                    new_keys_buffer=qkv_buffer,
+                    new_values_buffer=qkv_buffer,
+                    key_buffer=k_cache,
+                    value_buffer=v_cache,
+                    block_table_buffer=block_table_buffer,
+                    seq_lens_buffer=seq_lens_buffer,
+                    output_buffer=attn_output_buffer,
+                    num_seqs=num_seqs,
+                    max_seq_len=max_seq_len,
+                    max_blocks_per_seq=max_blocks_per_seq,
+                    query_offset=0,
+                    new_keys_offset=k_offset_bytes,
+                    new_values_offset=v_offset_bytes,
+                    output_offset=0,
+                )
+
 
         # BARRIER 2: Attention complete (always needed before O-proj)
         step_ctx.memory_barrier()
+
+        if CHECKPOINT_DEBUG_ENABLED:
+            self._capture_checkpoint(
+                 name=f"layer{layer_idx}_attn_context",
+                 buffer=attn_output_buffer,
+                 shape=(num_tokens, md.hidden_size),
+                 dtype=np.float16,
+                 step_ctx=step_ctx,
+            )
 
         # 5. O Projection + residual add
         layer_ops.o_proj.encode(
@@ -832,6 +1094,15 @@ class EngineRunner:
             output_buffer=hidden_states,
             num_tokens=num_tokens,
         )
+
+        if CHECKPOINT_DEBUG_ENABLED:
+             self._capture_checkpoint(
+                 name=f"layer{layer_idx}_attn_output",
+                 buffer=hidden_states,
+                 shape=(num_tokens, md.hidden_size),
+                 dtype=np.float16,
+                 step_ctx=step_ctx,
+            )
 
         # Add residual
         self._elementwise.encode_residual_add(
@@ -882,6 +1153,15 @@ class EngineRunner:
             step_ctx.memory_barrier()
 
         # 9. Final residual add
+        if CHECKPOINT_DEBUG_ENABLED:
+             self._capture_checkpoint(
+                 name=f"layer{layer_idx}_mlp_down",
+                 buffer=mlp_output_buffer,
+                 shape=(num_tokens, md.hidden_size),
+                 dtype=np.float16,
+                 step_ctx=step_ctx,
+             )
+
         self._elementwise.encode_residual_add(
             step_ctx=step_ctx,
             x=mlp_output_buffer,
@@ -1025,3 +1305,326 @@ class EngineRunner:
             "hidden_size": self.model_desc.hidden_size,
             "vocab_size": self.model_desc.vocab_size,
         }
+
+    # ========================================================================
+    # Debug checkpoint capture (VLLM_PREFILL_EQ_DEBUG=1)
+    # ========================================================================
+
+    def _capture_checkpoint(
+        self,
+        name: str,
+        buffer: Any,  # MTLBuffer
+        shape: Tuple[int, ...],
+        dtype: np.dtype = np.float16,
+        offset: int = 0,
+        last_token_only: bool = True,
+        num_tokens: Optional[int] = None,
+        step_ctx: Optional[Any] = None,
+    ) -> None:
+        """Capture a checkpoint from MTLBuffer for debugging.
+
+        This method is only active when CHECKPOINT_DEBUG_ENABLED=True.
+        
+        Refactored to use DEFERRED CAPTURE:
+        1. If step_ctx is provided (Execution Phase):
+           - Allocate a shadow buffer
+           - Encode a BLIT command to copy data GPU-side
+           - Add to pending list
+        2. If step_ctx is None:
+           - Immediate read (Warning: unsafe if GPU busy)
+        """
+        if not CHECKPOINT_DEBUG_ENABLED:
+            return
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"DEBUG: Requesting capture checkpoint {name}")
+        
+        try:
+            # Calculate size
+            size_bytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
+
+            if step_ctx is not None:
+                # DEFERRED CAPTURE (Safe)
+                # 1. Allocate shadow buffer
+                shadow_buffer = self._context.create_buffer(size_bytes + offset, "shared")
+                
+                # 2. Get Blit Encoder (requires ending compute encoder first)
+                # Note: step_ctx.end_compute_encoder_for_mps() is for MPS, but works here too
+                # to get the command buffer.
+                # However, step_ctx has get_compute_encoder() which re-opens.
+                # We need to manually handle the blit encoder.
+                
+                if step_ctx._encoder is not None:
+                    step_ctx._encoder.endEncoding()
+                    step_ctx._encoder = None
+                
+                cmd_buffer = step_ctx.command_buffer
+                blit = cmd_buffer.blitCommandEncoder()
+                
+                if blit is None:
+                    raise RuntimeError("Failed to create blit encoder")
+
+                # 3. Encode Copy
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size_(
+                    buffer, offset, shadow_buffer, offset, size_bytes
+                )
+                blit.endEncoding()
+                
+                # 4. Restore Compute Encoder for subsequent ops
+                step_ctx.get_compute_encoder()
+                
+                # 5. Add to pending list
+                self._pending_checkpoints.append({
+                    "name": name,
+                    "buffer": shadow_buffer,
+                    "shape": shape,
+                    "dtype": dtype,
+                    "offset": offset,
+                    "last_token_only": last_token_only,
+                    "num_tokens": num_tokens
+                })
+                
+            else:
+                # IMMEDIATE READ (Unsafe if GPU pending)
+                # Fallback for initialization time or non-step Context
+                logger.warning(f"Immediate capture for {name} (no step_ctx). May be zero.")
+                self._process_checkpoint_read(name, buffer, shape, dtype, offset, last_token_only, num_tokens)
+
+        except Exception as e:
+            logger.warning(f"Failed to capture checkpoint '{name}': {e}")
+
+    def _process_checkpoint_read(self, name, buffer, shape, dtype, offset, last_token_only, num_tokens):
+        """Process the actual readback of a buffer."""
+        from vllm_apple.debug import capture_checkpoint
+        try:
+            # Calculate size
+            size_bytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
+            
+            # Read from buffer
+            buffer_view = buffer.contents().as_buffer(offset + size_bytes)
+            np_array = np.frombuffer(buffer_view, dtype=dtype, offset=offset).reshape(shape).copy()
+
+            # Convert to torch tensor
+            tensor = torch.from_numpy(np_array)
+
+            # If last_token_only, extract just that position
+            token_idx = None
+            if last_token_only and num_tokens is not None and num_tokens > 0:
+                token_idx = num_tokens - 1
+
+            # Store checkpoint
+            capture_checkpoint(name, tensor, source="engine", token_idx=token_idx)
+            # logger.info(f"DEBUG: Captured {name}") # Too verbose? 
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Failed to process readback {name}: {e}")
+
+
+    def _init_checkpoint_context(self, num_tokens: int) -> None:
+        """Initialize checkpoint store context for this step.
+
+        Args:
+            num_tokens: Number of tokens in this step
+        """
+        if not CHECKPOINT_DEBUG_ENABLED:
+            return
+
+        try:
+            from vllm_apple.debug import get_checkpoint_store, reset_stores
+
+            # Reset stores for new comparison
+            reset_stores()
+
+            # Set up engine store context
+            store = get_checkpoint_store("engine")
+            store.set_context(
+                source="engine",
+                num_layers=self.model_desc.num_layers,
+                last_pos=num_tokens - 1 if num_tokens > 0 else 0,
+            )
+            logger.info(
+                f"[CHECKPOINT] Debug capture enabled for step {self._step_counter}, "
+                f"num_tokens={num_tokens}, num_layers={self.model_desc.num_layers}"
+            )
+            # Reset stores for new comparison
+            reset_stores()
+
+        except Exception as e:
+            logger.warning(f"Failed to init checkpoint context: {e}")
+
+    def _cpu_rope(
+        self,
+        step_ctx: EngineStepContext,
+        qkv_buffer: Any,
+        positions_buffer: Any,
+        num_tokens: int,
+        layer_idx: int,
+    ) -> None:
+        """Apply RoPE on CPU (Isolation Toggle)."""
+        md = self.model_desc
+        head_size = md.head_size
+        num_heads = md.num_attention_heads
+        num_kv_heads = md.num_kv_heads
+        
+        # Read buffers
+        # Note: reading entire buffer, not just the slice for num_tokens if flattened?
+        # buffers are scratch buffers sized for max_tokens.
+        # We need to read just num_tokens.
+        qkv_elements = num_tokens * (num_heads + 2 * num_kv_heads) * head_size
+        qkv_size_bytes = qkv_elements * 2
+        
+        # Read QKV
+        qkv_view = qkv_buffer.contents().as_buffer(qkv_size_bytes)
+        qkv_np = np.frombuffer(qkv_view, dtype=np.float16).copy()
+        
+        # Read Positions
+        pos_size_bytes = num_tokens * 4
+        pos_view = positions_buffer.contents().as_buffer(pos_size_bytes)
+        positions = np.frombuffer(pos_view, dtype=np.int32).copy()
+        
+        # Planar Layout: [All Q] [All K] [All V]
+        q_elements = num_tokens * num_heads * head_size
+        k_elements = num_tokens * num_kv_heads * head_size
+        v_elements = num_tokens * num_kv_heads * head_size
+        
+        # Slices
+        q_part = qkv_np[:q_elements]
+        k_part = qkv_np[q_elements : q_elements + k_elements]
+        v_part = qkv_np[q_elements + k_elements :]
+        
+        # Reshape to [tokens, heads, dim]
+        q = torch.from_numpy(q_part).view(num_tokens, num_heads, head_size).float()
+        k = torch.from_numpy(k_part).view(num_tokens, num_kv_heads, head_size).float()
+        # v is untouched by RoPE, but we must preserve it for writeback
+        
+        # Prepare RoPE - HALF-HALF Rotation (Neox/Llama/Qwen style)
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        # Basic RoPE calculation:
+        # q_embed = (q * cos) + (rotate_half(q) * sin)
+        
+        theta = md.rope_theta
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_size, 2).float() / head_size))
+        # Ensure positions is float for matmul
+        t = torch.from_numpy(positions).float()[:, None] * inv_freq[None, :]  # [tokens, head_size/2]
+        emb = torch.cat((t, t), dim=-1)  # [tokens, head_size]
+        
+        cos = emb.cos().to(dtype=torch.float16)
+        sin = emb.sin().to(dtype=torch.float16)
+
+        # Reshape cos/sin for broadcasting [tokens, 1, head_size]
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        
+        # Apply RoPE
+        q_rope = (q * cos) + (rotate_half(q) * sin)
+        k_rope = (k * cos) + (rotate_half(k) * sin)
+        
+        # IMPORTANT: Write back in PLANAR layout
+        # [Q_rope] [K_rope] [V_original]
+        # v_part is already numpy array of correct size/offset
+        
+        q_out_np = q_rope.flatten().to(torch.float16).numpy()
+        k_out_np = k_rope.flatten().to(torch.float16).numpy()
+        
+        # Write back to qkv_view
+        # Slice view
+        view_ptr = memoryview(qkv_view)
+        
+        # Q write
+        q_bytes = q_elements * 2
+        view_ptr[:q_bytes] = q_out_np.tobytes()
+        
+        # K write
+        k_bytes = k_elements * 2
+        view_ptr[q_bytes : q_bytes + k_bytes] = k_out_np.tobytes()
+        
+        # V is unchanged, so no write needed (it was copied from buffer originally? No, qkv_view is slice of shared buffer?)
+        # qkv_np was COPY. qkv_view is direct buffer access?
+        # "qkv_view = qkv_buffer.contents().as_buffer()" -> Direct memory.
+        # "qkv_np = np.frombuffer(...).copy()" -> Copy.
+        # So V in buffer is untouched. We only need to write Q and K.
+        # Done.
+        
+        logger.info(f"Layer {layer_idx}: CPU RoPE Applied (Half-Half) - Max diff Q: {(q_rope-q).abs().max()}")
+
+
+    def _cpu_sdpa(
+        self,
+        step_ctx: Any,
+        qkv_buffer: Any,
+        output_buffer: Any,
+        num_tokens: int,
+        layer_idx: int,
+        num_seqs: int,
+        max_seq_len: int,
+        token_to_seq_buffer: Any,
+    ) -> None:
+        """Apply SDPA on CPU (Isolation Toggle)."""
+        md = self.model_desc
+        head_size = md.head_size
+        num_heads = md.num_attention_heads
+        num_kv_heads = md.num_kv_heads
+        scale = 1.0 / (head_size ** 0.5)
+        
+        # Read QKV
+        qkv_elements = num_tokens * (num_heads + 2 * num_kv_heads) * head_size
+        qkv_size_bytes = qkv_elements * 2
+        qkv_view = qkv_buffer.contents().as_buffer(qkv_size_bytes)
+        qkv_np = np.frombuffer(qkv_view, dtype=np.float16).copy()
+        qkv = torch.from_numpy(qkv_np).view(num_tokens, num_heads + 2 * num_kv_heads, head_size)
+        
+        q = qkv[:, :num_heads, :].float()
+        k = qkv[:, num_heads:num_heads+num_kv_heads, :].float()
+        v = qkv[:, num_heads+num_kv_heads:, :].float()
+        
+        # Read token_to_seq
+        tts_size_bytes = num_tokens * 4
+        tts_view = token_to_seq_buffer.contents().as_buffer(tts_size_bytes)
+        token_to_seq = np.frombuffer(tts_view, dtype=np.int32).copy()
+        
+        # Output container
+        output = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float32)
+        
+        # Iterate sequences
+        unique_seqs = np.unique(token_to_seq)
+        for seq_id in unique_seqs:
+            # Find tokens for seq i
+            # Assuming contiguous because prefill
+            indices = np.where(token_to_seq == seq_id)[0]
+            if len(indices) == 0: continue
+            
+            start = indices[0]
+            end = indices[-1] + 1
+            
+            # Slice: [L, H, D] -> [1, H, L, D]
+            s_q = q[start:end].permute(1, 0, 2).unsqueeze(0) 
+            s_k = k[start:end].permute(1, 0, 2).unsqueeze(0)
+            s_v = v[start:end].permute(1, 0, 2).unsqueeze(0)
+            
+            if num_kv_heads != num_heads:
+                 s_k = s_k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                 s_v = s_v.repeat_interleave(num_heads // num_kv_heads, dim=1)
+            
+            # SDPA
+            s_out = torch.nn.functional.scaled_dot_product_attention(
+                s_q, s_k, s_v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True,
+                scale=scale
+            )
+            
+            # [1, H, L, D] -> [L, H, D]
+            output[start:end] = s_out.squeeze(0).permute(1, 0, 2)
+            
+        # Write back
+        out_elements = num_tokens * num_heads * head_size
+        out_size_bytes = out_elements * 2
+        out_view = output_buffer.contents().as_buffer(out_size_bytes)
+        np.copyto(np.frombuffer(out_view, dtype=np.float16), output.flatten().to(torch.float16).numpy())
+        
+        logger.info(f"DEBUG: Applied PyTorch SDPA for layer {layer_idx}")

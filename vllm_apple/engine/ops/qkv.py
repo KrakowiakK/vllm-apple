@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from vllm.logger import init_logger
 from ..tensor import EngineTensor, EngineDType
 from .gemm import EngineGEMM
+from .elementwise import EngineElementwiseOps
 
 logger = init_logger(__name__)
 
@@ -138,6 +139,7 @@ class EngineQKVProjection:
 
         # Create GEMM op
         self._gemm = EngineGEMM(context)
+        self._elementwise = EngineElementwiseOps(context)
 
         # Pre-compute offsets for Q, K, V splits
         self._q_offset = 0
@@ -330,59 +332,88 @@ class EngineQKVProjection:
                 dtype=EngineDType.FLOAT16,
                 offset=0,
             )
+        element_size = 2 # float16
+
+        if self.config.q_size > 0:
+            import logging
+            logging.getLogger(__name__).info(f"DEBUG: QKV Encode Q: weight={self._q_weight}, M={num_tokens}, K={self.config.hidden_size}, N={self.config.q_size}")
             self._gemm.encode(
-                step_ctx=step_ctx,
-                A=hidden_states,
-                B=self._q_weight,
-                C=q_tensor,
+                step_ctx, 
+                hidden_states, 
+                self._q_weight, 
+                q_tensor, 
                 M=num_tokens,
                 K=self.config.hidden_size,
                 N=self.config.q_size,
-                transpose_B=True,  # Weight is [q_size, hidden_size]
+                transpose_B=False
             )
 
-            # K projection at offset after Q
-            k_offset_bytes = num_tokens * self.config.q_size * element_size
-            k_tensor = EngineTensor(
-                buffer=qkv_output,
-                shape=(num_tokens, self.config.k_size),
-                dtype=EngineDType.FLOAT16,
-                offset=k_offset_bytes,
-            )
+        # K projection at offset after Q
+        k_offset_bytes = num_tokens * self.config.q_size * element_size
+        k_tensor = EngineTensor(
+            buffer=qkv_output,
+            shape=(num_tokens, self.config.k_size),
+            dtype=EngineDType.FLOAT16,
+            offset=k_offset_bytes,
+        )
+        if self.config.k_size > 0:
             self._gemm.encode(
-                step_ctx=step_ctx,
-                A=hidden_states,
-                B=self._k_weight,
-                C=k_tensor,
+                step_ctx,
+                hidden_states,
+                self._k_weight,
+                k_tensor,
                 M=num_tokens,
                 K=self.config.hidden_size,
                 N=self.config.k_size,
-                transpose_B=True,
+                transpose_B=False
             )
 
-            # V projection at offset after Q and K
-            v_offset_bytes = num_tokens * (self.config.q_size + self.config.k_size) * element_size
-            v_tensor = EngineTensor(
-                buffer=qkv_output,
-                shape=(num_tokens, self.config.v_size),
-                dtype=EngineDType.FLOAT16,
-                offset=v_offset_bytes,
-            )
+        # V projection at offset after Q and K
+        v_offset_bytes = num_tokens * (self.config.q_size + self.config.k_size) * element_size
+        v_tensor = EngineTensor(
+            buffer=qkv_output,
+            shape=(num_tokens, self.config.v_size),
+            dtype=EngineDType.FLOAT16,
+            offset=v_offset_bytes,
+        )
+        if self.config.v_size > 0:
             self._gemm.encode(
-                step_ctx=step_ctx,
-                A=hidden_states,
-                B=self._v_weight,
-                C=v_tensor,
+                step_ctx,
+                hidden_states,
+                self._v_weight,
+                v_tensor,
                 M=num_tokens,
                 K=self.config.hidden_size,
                 N=self.config.v_size,
-                transpose_B=True,
+                transpose_B=False
             )
 
         # If we have bias, need to add it
         if self._bias_buffer is not None:
-            # TODO: Encode bias addition kernel
-            logger.warning("QKV bias not yet implemented")
+            # Add bias to Q [num_tokens, q_size]
+            q_out = EngineTensor(qkv_output, shape=(num_tokens, self.config.q_size), dtype=EngineDType.FLOAT16, offset=0)
+            q_bias = EngineTensor(self._bias_buffer, shape=(self.config.q_size,), dtype=EngineDType.FLOAT16, offset=0)
+            self._elementwise.encode_bias_add_inplace(
+                step_ctx, q_out, q_bias, self.config.q_size, num_tokens * self.config.q_size
+            )
+
+            # Add bias to K [num_tokens, k_size]
+            k_out_offset = num_tokens * self.config.q_size * element_size
+            k_bias_offset = self.config.q_size * element_size
+            k_out = EngineTensor(qkv_output, shape=(num_tokens, self.config.k_size), dtype=EngineDType.FLOAT16, offset=k_out_offset)
+            k_bias = EngineTensor(self._bias_buffer, shape=(self.config.k_size,), dtype=EngineDType.FLOAT16, offset=k_bias_offset)
+            self._elementwise.encode_bias_add_inplace(
+                step_ctx, k_out, k_bias, self.config.k_size, num_tokens * self.config.k_size
+            )
+
+            # Add bias to V [num_tokens, v_size]
+            v_out_offset = num_tokens * (self.config.q_size + self.config.k_size) * element_size
+            v_bias_offset = (self.config.q_size + self.config.k_size) * element_size
+            v_out = EngineTensor(qkv_output, shape=(num_tokens, self.config.v_size), dtype=EngineDType.FLOAT16, offset=v_out_offset)
+            v_bias = EngineTensor(self._bias_buffer, shape=(self.config.v_size,), dtype=EngineDType.FLOAT16, offset=v_bias_offset)
+            self._elementwise.encode_bias_add_inplace(
+                step_ctx, v_out, v_bias, self.config.v_size, num_tokens * self.config.v_size
+            )
 
         # Memory barrier after GEMM
         step_ctx.memory_barrier()

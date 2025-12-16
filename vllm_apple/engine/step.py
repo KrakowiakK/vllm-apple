@@ -158,6 +158,50 @@ class EngineStepContext:
 
         return self
 
+    def flush_and_sync(self) -> None:
+        """Submit current command buffer, wait for completion, and restart for more encoding.
+        
+        This enables Hybrid Execution (GPU -> CPU -> GPU) within a single step.
+        """
+        logger.info(f"Step {self.step_id}: Flushing and syncing middleware...")
+        
+        # 1. End current encoder
+        if self._encoder is not None:
+             self._encoder.endEncoding()
+             self._encoder = None
+             
+        # 2. Submit and Wait
+        if self._command_buffer is not None:
+             self._command_buffer.commit()
+             self._command_buffer.waitUntilCompleted()
+             
+             # Check for errors
+             error = self._command_buffer.error()
+             if error is not None:
+                 raise RuntimeError(f"GPU Execution Failed during flush: {error}")
+                 
+        # 3. Restart Command Buffer
+        self._command_buffer = self._context.new_command_buffer()
+        self._encoder = self._command_buffer.computeCommandEncoder()
+        if self._encoder is None:
+             raise RuntimeError("Failed to create compute encoder after flush")
+             
+        # Reset internal state
+        self._current_phase = EnginePhase.ENCODE
+        self._is_submitted = False
+        
+    def end_encoding(self) -> None:
+        """End encoding phase."""
+        if self._current_phase != EnginePhase.ENCODE:
+            return
+
+        if self._encoder:
+            self._encoder.endEncoding()
+            self._encoder = None
+
+        self._current_phase = EnginePhase.SUBMIT
+        EngineHotPathGuard.set_phase(EnginePhase.SUBMIT)
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit step context - cleanup resources."""
         # === INSTRUMENTATION: Print stats for batch=1 decode ===

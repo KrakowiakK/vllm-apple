@@ -47,6 +47,30 @@ Environment Variables:
         allocation and limits how many tokens can be processed in one step.
         For batch 16 with ~20 tokens per prompt, need at least 320. Default: 256
 
+Debug Environment Variables (for equivalence testing):
+    VLLM_PREFILL_EQ_DEBUG:
+        Enable checkpoint capture for debugging prefill divergence.
+        Captures intermediate tensors for comparison with PyTorch reference.
+        WARNING: Causes performance degradation. Default: "0"
+
+    VLLM_PREFILL_DISABLE_CHUNKING:
+        Disable chunked prefill and process all tokens in a single pass.
+        This can help isolate chunking-related divergence. Default: "0"
+        NOTE: The Metal engine already processes prefill in a single pass,
+        so this toggle affects only the scheduler-level chunking if enabled.
+
+    VLLM_PREFILL_USE_PYTORCH_ATTN:
+        Use PyTorch SDPA attention instead of custom Metal PagedAttention
+        kernel for prefill. Useful for isolating attention-related divergence.
+        WARNING: Significantly slower and may require additional memory.
+        Default: "0"
+
+    VLLM_PREFILL_FLOAT32_NORM:
+        Use float32 accumulation in RMSNorm reduction. The Metal kernel
+        already uses float32 for the reduction sum, so this toggle enables
+        additional float32 intermediate storage if needed. Default: "0"
+        NOTE: The current implementation already uses float32 reduction.
+
 Usage:
     from vllm_apple.engine.config import is_engine_mode_enabled, EngineConfig
 
@@ -73,6 +97,12 @@ RESOURCE_PATH_ENV = "VLLM_METAL_PATH_RESOURCES"
 TOPK_LOGITS_ENV = "VLLM_METAL_TOPK_LOGITS"
 SCRATCH_POOL_ENV = "VLLM_METAL_SCRATCH_POOL_MB"
 MAX_BATCH_SIZE_ENV = "VLLM_METAL_MAX_BATCH_SIZE"
+
+# Debug environment variables for equivalence testing
+DEBUG_CHECKPOINT_ENV = "VLLM_PREFILL_EQ_DEBUG"
+DEBUG_DISABLE_CHUNKING_ENV = "VLLM_PREFILL_DISABLE_CHUNKING"
+DEBUG_USE_PYTORCH_ATTN_ENV = "VLLM_PREFILL_USE_PYTORCH_ATTN"
+DEBUG_FLOAT32_NORM_ENV = "VLLM_PREFILL_FLOAT32_NORM"
 
 
 def is_engine_mode_enabled() -> bool:
@@ -179,6 +209,49 @@ def get_max_batch_size() -> int:
         return 256
 
 
+# =============================================================================
+# Debug toggle helpers for equivalence testing
+# =============================================================================
+
+def is_debug_checkpoint_enabled() -> bool:
+    """Check if checkpoint capture is enabled for debugging.
+
+    Returns:
+        True if VLLM_PREFILL_EQ_DEBUG=1
+    """
+    return os.environ.get(DEBUG_CHECKPOINT_ENV, "0") == "1"
+
+
+def is_chunking_disabled() -> bool:
+    """Check if chunked prefill should be disabled.
+
+    Returns:
+        True if VLLM_PREFILL_DISABLE_CHUNKING=1
+    """
+    return os.environ.get(DEBUG_DISABLE_CHUNKING_ENV, "0") == "1"
+
+
+def use_pytorch_attention() -> bool:
+    """Check if PyTorch SDPA attention should be used instead of Metal kernel.
+
+    Returns:
+        True if VLLM_PREFILL_USE_PYTORCH_ATTN=1
+    """
+    return os.environ.get(DEBUG_USE_PYTORCH_ATTN_ENV, "0") == "1"
+
+
+def use_float32_norm() -> bool:
+    """Check if float32 RMSNorm should be used.
+
+    Note: The current Metal kernel already uses float32 for reduction.
+    This toggle is for additional float32 usage if needed.
+
+    Returns:
+        True if VLLM_PREFILL_FLOAT32_NORM=1
+    """
+    return os.environ.get(DEBUG_FLOAT32_NORM_ENV, "0") == "1"
+
+
 @dataclass
 class EngineConfig:
     """Configuration for Metal engine execution.
@@ -227,6 +300,12 @@ class EngineConfig:
     validate_outputs: bool = True
     log_step_timing: bool = False
 
+    # Equivalence testing debug toggles
+    debug_checkpoint_enabled: bool = False
+    debug_disable_chunking: bool = False
+    debug_use_pytorch_attn: bool = False
+    debug_float32_norm: bool = False
+
     @classmethod
     def from_env(cls) -> "EngineConfig":
         """Create config from environment variables.
@@ -244,6 +323,11 @@ class EngineConfig:
             topk_logits=get_topk_logits(),
             max_batch_size=get_max_batch_size(),
             scratch_pool_size_mb=get_scratch_pool_size_mb(),
+            # Debug toggles
+            debug_checkpoint_enabled=is_debug_checkpoint_enabled(),
+            debug_disable_chunking=is_chunking_disabled(),
+            debug_use_pytorch_attn=use_pytorch_attention(),
+            debug_float32_norm=use_float32_norm(),
         )
 
     def validate(self) -> None:

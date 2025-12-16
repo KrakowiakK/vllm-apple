@@ -236,15 +236,17 @@ kernel void embedding_lookup_with_offset_kernel(
 
         # Dispatch: 2D grid (hidden_size x num_tokens)
         # Round hidden_size up to multiple of 32 for efficient threadgroup dispatch
-        threads_x = min(256, self.config.hidden_size)
+        threads_x = min(32, self.config.hidden_size)
         threads_y = 1
-
+        
         threadgroups_x = (self.config.hidden_size + threads_x - 1) // threads_x
         threadgroups_y = num_tokens
+        
+        logger.info(f"DEBUG: Dispatching embedding: threads=({threads_x}, {threads_y}), groups=({threadgroups_x}, {threadgroups_y})")
 
         thread_groups = MTLSize(threadgroups_x, threadgroups_y, 1)
         threads_per_threadgroup = MTLSize(threads_x, threads_y, 1)
-
+        
         encoder.dispatchThreadgroups_threadsPerThreadgroup_(
             thread_groups, threads_per_threadgroup
         )

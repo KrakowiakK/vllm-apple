@@ -395,7 +395,7 @@ class EngineGEMM:
         # CRITICAL: For large K or N, MPS is faster than Metal kernels.
         # The encoder transition overhead is smaller than Metal's performance gap.
         is_decode_single_seq = hasattr(step_ctx, 'decode_single_seq') and step_ctx.decode_single_seq
-        operation_supported = alpha == 1.0 and beta == 0.0 and not transpose_A
+        operation_supported = alpha == 1.0 and beta == 0.0 and not transpose_A and transpose_B
 
         # Size-based selection for decode_single_seq path
         # Only use Metal when K and N are both small enough

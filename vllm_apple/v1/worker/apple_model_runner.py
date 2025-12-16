@@ -145,6 +145,8 @@ class AppleModelRunner:
         self._engine_kv_cache = None  # Engine KV cache for prefill→decode sync
         if self._use_engine_mode:
             logger.info("Engine mode enabled (VLLM_APPLE_USE_ENGINE=1)")
+            import vllm_apple.engine.runner
+            logger.info(f"DEBUG: vllm_apple.engine.runner imported from: {vllm_apple.engine.runner.__file__}")
 
         # KV cache configuration
         self.kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -1717,7 +1719,11 @@ class AppleModelRunner:
                 if isinstance(token_id, (list, np.ndarray)):
                     token_id = int(token_id[0]) if len(token_id) > 0 else 0
                 req_state.output_token_ids.append(token_id)
-                req_state.num_computed_tokens += 1
+                # Increment by the number of tokens processed in this step
+                # For prefill: seq_lens[req_idx] = number of prefill tokens
+                # For decode: seq_lens[req_idx] = 1
+                tokens_processed = model_input.seq_lens[req_idx] if model_input.seq_lens else 1
+                req_state.num_computed_tokens += tokens_processed
 
         # Build output
         req_id_to_index = {
