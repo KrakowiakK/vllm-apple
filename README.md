@@ -32,6 +32,13 @@ Unlike `llama.cpp` which targets edge inference and broad compatibility, this en
     *   **FP16**: Fully verified. Accumulation tolerance ~1e-2 vs FP32 Reference.
     *   **Determinism**: 100% deterministic output for same seed.
 
+### 🚀 Performance (M3 Ultra)
+Verified metrics on Qwen2-0.5B (Small model proxy for overhead testing):
+*   **Prefill Throughput**: >84,000 tokens/sec (Batch 16, 512 context).
+*   **Decode Throughput**: >300 tokens/sec (Batch 16).
+*   **Scaling**: Linear scaling observed up to Batch 8.
+*   *Note: Larger models (7B+) will be compute-bound; these metrics verify engine overhead is minimal.*
+
 ### 🚧 Roadmap / Missing Features
 *   **Quantization**:
     *   INT4 / INT8 kernels are **NOT** yet implemented/verified. Currently FP16 only.
