@@ -38,9 +38,9 @@ Unlike `llama.cpp` which targets edge inference and broad compatibility, this en
 *   **Memory Usage**: ~31 GB (RSS). Fits 64GB/128GB Macs.
 *   **Prefill**: 70 tok/s (Batch 1) → 104 tok/s (Batch 2).
 *   **Decode (Batch 1)**: ~10.3 tok/s.
-    *   *Comparison*: `llama.cpp`/`mlx` achieve ~15-20 tok/s at Batch 1.
-    *   *Why?*: `llama.cpp` uses a pure C++ loop with zero overhead. Our v2.6 engine uses a Python dispatcher which adds overhead per layer.
-    *   *Trade-off*: We prioritize **Throughput**. At Batch 8+, our engine scales linearly where `llama.cpp` typically chokes.
+    *   *Comparison*: `llama.cpp`/`mlx` achieve ~15-18 tok/s (FP16).
+    *   *Why?*: Competitors use C++ runtimes that hit the hardware memory bandwidth limit (~18 tok/s for 44GB model @ 800GB/s).
+    *   *Status*: We are at ~57% of hardware limit due to Python overhead. **Graph Capture** (Roadmap) will close this gap.
 *   **Decode (Batch 16)**: Estimated >150 tok/s aggregate throughput (based on scaling metrics).
 
 **2. Engine Overhead (Qwen2-0.5B Proxy)**:
